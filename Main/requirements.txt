@@ -1,0 +1,21 @@
+# API Server Dependencies for Robot Navigation System
+
+# Web Framework
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# YOLO Model
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Path Planning Algorithm
+python-tsp>=0.3.1
+
+# Additional utilities
+requests>=2.31.0
