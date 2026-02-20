@@ -10,6 +10,7 @@ from flask import Flask, request, jsonify
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageEnhance
@@ -291,8 +292,8 @@ def image_recognition():
             except:
                 pass
     
-    # Save file temporarily
-    temp_path = f"/tmp/{filename}"
+    # Save file temporarily (cross-platform)
+    temp_path = os.path.join(tempfile.gettempdir(), filename)
     file.save(temp_path)
     
     try:
@@ -485,7 +486,7 @@ def main():
     print("="*60)
     print("\nServer starting...\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
 
 if __name__ == '__main__':
     main()
