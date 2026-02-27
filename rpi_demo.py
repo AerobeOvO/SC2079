@@ -6,7 +6,7 @@ rpi_demo.py  –  Android → RPi → STM32 Manual-Control Bridge
 DATA FLOW
 ─────────
   Android tablet
-      │  Bluetooth RFCOMM (JSON)
+      │  Bluetooth RFCOMM (plain text)
       ▼
   Raspberry Pi  (this script)
       │  Serial UART  (plain text command)
@@ -16,23 +16,24 @@ DATA FLOW
       ▼
   Raspberry Pi  →  relays ACK back to Android
 
-ANDROID → RPI  –  message format  (JSON, newline-terminated)
-─────────────────────────────────────────────────────────────
-  {"cat": "manual",  "value": "FWD:10"}   ← forward  10 cm
-  {"cat": "manual",  "value": "REV:10"}   ← reverse  10 cm
-  {"cat": "manual",  "value": "TURNL:90"} ← turn left  90 °
-  {"cat": "manual",  "value": "TURNR:90"} ← turn right 90 °
-  {"cat": "manual",  "value": "STOP"}     ← stop motors
-  {"cat": "manual",  "value": "OLED:Hi"}  ← OLED message
-  {"cat": "control", "value": "start"}    ← alias for FWD:10 (demo)
-
-RPI → ANDROID  –  reply format  (JSON, newline-terminated)
+ANDROID → RPI  –  plain-text commands (newline-terminated)
 ────────────────────────────────────────────────────────────
-  {"cat": "info",  "value": "Connected to RPi!"}
-  {"cat": "info",  "value": "Sent: FWD:10"}
-  {"cat": "info",  "value": "ACK received for: FWD:10"}
-  {"cat": "error", "value": "Unknown command: XYZ"}
-  {"cat": "error", "value": "STM32 did not ACK: FWD:10"}
+  f      → FWD:10   (forward  10 cm)
+  r      → REV:10   (reverse  10 cm)
+  tl     → TURNL:90 (turn left  90°)
+  tr     → TURNR:90 (turn right 90°)
+  s      → STOP     (stop motors)
+
+  You may also send the full STM32 command directly:
+  FWD:20 / REV:5 / TURNL:45 / TURNR:45 / STOP / OLED:Hi
+
+RPI → ANDROID  –  plain-text replies (newline-terminated)
+───────────────────────────────────────────────────────────
+  "Connected to RPi! Ready to receive commands."
+  "Sent to STM32: FWD:10"
+  "ACK received for: FWD:10"
+  "ERROR: Unknown command: XYZ"
+  "ERROR: STM32 did not ACK: FWD:10"
 
 STM32 COMMAND FORMAT  (rpi.py style, sent verbatim over serial)
 ───────────────────────────────────────────────────────────────
@@ -52,7 +53,6 @@ Press Ctrl+C to quit cleanly.
 """
 
 import bluetooth
-import json
 import logging
 import os
 import queue
@@ -85,22 +85,54 @@ BT_UUID         = "94f39d29-7d6d-437d-973b-fba39e49d4ee"   # same UUID as Week_9
 # ─── STM32 timing ─────────────────────────────────────────────────────────────
 STM_ACK_TIMEOUT = 15.0      # seconds to wait for ACK before flagging a warning
 
-# ─── Commands the RPi is allowed to forward to STM32 ─────────────────────────
-#     Add more prefixes here if your STM32 firmware understands them.
+# ─── Short-code → STM32 command mapping (Android plain-text buttons) ─────────
+#
+#   Android sends  │  RPi forwards to STM32
+#   ───────────────┼──────────────────────
+#      f           │  FWD:10
+#      r           │  REV:10
+#      tl          │  TURNL:90
+#      tr          │  TURNR:90
+#      s           │  STOP
+#
+#   Adjust the default values (10 cm / 90°) to match your robot's tuning.
+#
+SHORTCODE_MAP = {
+    "f":  "FWD:10",
+    "r":  "REV:10",
+    "tl": "TURNL:90",
+    "tr": "TURNR:90",
+    "s":  "STOP",
+}
+
+# Full-command prefixes that are forwarded verbatim (case-insensitive)
 VALID_PREFIXES = (
-    "FWD:",     # forward
-    "REV:",     # reverse / backward
-    "TURNL:",   # turn left
-    "TURNR:",   # turn right
-    "STOP",     # stop (no colon – it is a bare keyword)
-    "OLED:",    # display message on OLED
+    "FWD:",
+    "REV:",
+    "TURNL:",
+    "TURNR:",
+    "STOP",
+    "OLED:",
 )
 
 
-def is_valid_command(cmd: str) -> bool:
-    """Return True if cmd starts with a known prefix (case-insensitive)."""
-    upper = cmd.upper()
-    return any(upper.startswith(p) for p in VALID_PREFIXES)
+def parse_android_command(raw: str) -> Optional[str]:
+    """
+    Accept either a short-code (f / r / tl / tr / s) or a full STM32 command
+    (FWD:10, TURNL:90 …).  Returns the STM32 command string, or None if unknown.
+    """
+    token = raw.strip().lower()
+
+    # Short-code lookup first
+    if token in SHORTCODE_MAP:
+        return SHORTCODE_MAP[token]
+
+    # Full command — check against known prefixes
+    upper = token.upper()
+    if any(upper.startswith(p) for p in VALID_PREFIXES):
+        return upper   # normalise to upper-case before sending
+
+    return None   # unrecognised
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,21 +221,21 @@ class AndroidBT:
         log.info(f"✅  Android connected  {info}")
 
     # ── Send ──────────────────────────────────────────────────────────────────
-    def send(self, cat: str, value) -> None:
-        """Send a JSON message (cat + value) to Android, newline-terminated."""
-        msg = json.dumps({"cat": cat, "value": value}) + "\n"
+    def send(self, text: str) -> None:
+        """Send a plain-text line to Android, newline-terminated."""
+        msg = text.rstrip("\n") + "\n"
         try:
             self._client.send(msg.encode("utf-8"))
-            log.debug(f"  →Android  {msg.strip()}")
+            log.debug(f"  →Android  {msg.strip()!r}")
         except OSError as exc:
             log.error(f"BT send error: {exc}")
             raise
 
     # ── Receive ───────────────────────────────────────────────────────────────
-    def recv(self) -> Optional[dict]:
+    def recv(self) -> Optional[str]:
         """
-        Return the next complete JSON object received from Android, or None.
-        Handles partial / multi-message reads by buffering internally.
+        Return the next non-empty line received from Android (plain text).
+        Buffers internally to handle partial / multi-line TCP reads.
         Raises OSError on connection loss.
         """
         while True:
@@ -213,15 +245,10 @@ class AndroidBT:
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    obj = json.loads(line)
-                    log.debug(f"  ←Android  {line}")
-                    return obj
-                except json.JSONDecodeError as exc:
-                    log.error(f"Bad JSON from Android: {exc}  raw={line!r}")
-                    return None
+                log.debug(f"  ←Android  {line!r}")
+                return line
 
-            # Read more data from the socket
+            # Read more bytes from the socket
             chunk = self._client.recv(1024)
             if not chunk:
                 raise OSError("Android socket closed (recv returned empty)")
@@ -245,7 +272,7 @@ class AndroidBT:
 class DemoController:
     """
     Orchestrates two threads:
-      • _thread_recv_android  – reads JSON from Android, validates, enqueues
+      • _thread_recv_android  – reads plain-text from Android, maps to STM32 command, enqueues
       • _thread_send_stm      – dequeues commands, sends to STM32, waits for ACK
     """
 
@@ -268,7 +295,7 @@ class DemoController:
         self.android.connect()
 
         # 3. Welcome message
-        self.android.send("info", "Connected to RPi! Ready to receive commands.")
+        self.android.send("Connected to RPi! Ready to receive commands.")
 
         self._running = True
 
@@ -294,55 +321,38 @@ class DemoController:
     # ── Thread: Receive from Android ──────────────────────────────────────────
     def _thread_recv_android(self) -> None:
         """
-        Continuously reads JSON messages from the Android tablet.
+        Continuously reads plain-text lines from the Android tablet.
 
-        Recognised message types
-        ────────────────────────
-        {"cat": "manual",  "value": "<STM_CMD>"}
-            Validate the command string, then enqueue for STM32.
+        Accepted inputs (case-insensitive)
+        ────────────────────────────────────
+          f      → FWD:10   (forward)
+          r      → REV:10   (reverse)
+          tl     → TURNL:90 (turn left)
+          tr     → TURNR:90 (turn right)
+          s      → STOP
 
-        {"cat": "control", "value": "start"}
-            Convenience alias – sends a default FWD:10 (demonstrates the flow).
-
-        {"cat": "control", "value": "stop"}
-            Immediately enqueues STOP.
+          Full commands also accepted verbatim:
+          FWD:20 / REV:5 / TURNL:45 / TURNR:45 / STOP / OLED:Hi
         """
         while self._running:
             try:
-                msg = self.android.recv()
+                raw = self.android.recv()
             except OSError:
                 log.error("Android disconnected – stopping recv thread")
                 self._running = False
                 break
 
-            if msg is None:
+            if raw is None:
                 continue
 
-            cat   = msg.get("cat", "").strip()
-            value = str(msg.get("value", "")).strip()
+            cmd = parse_android_command(raw)
 
-            # ── Manual movement command ───────────────────────────────────────
-            if cat == "manual":
-                cmd = value.upper()        # normalise to upper-case
-                if is_valid_command(cmd):
-                    log.info(f"📥  Android → command: {cmd}")
-                    self.cmd_queue.put(cmd)
-                else:
-                    log.warning(f"⚠️  Invalid command from Android: {value!r}")
-                    self._safe_send_android("error", f"Unknown command: {value}")
-
-            # ── Control: start (demo shortcut: move forward 10 cm) ────────────
-            elif cat == "control" and value.lower() == "start":
-                log.info("📥  Android → 'start' – sending FWD:10 as demo")
-                self.cmd_queue.put("FWD:10")
-
-            # ── Control: stop ─────────────────────────────────────────────────
-            elif cat == "control" and value.lower() == "stop":
-                log.info("📥  Android → 'stop'")
-                self.cmd_queue.put("STOP")
-
+            if cmd is not None:
+                log.info(f"📥  Android → {raw!r}  maps to  {cmd}")
+                self.cmd_queue.put(cmd)
             else:
-                log.warning(f"Unhandled message  cat={cat!r}  value={value!r}")
+                log.warning(f"⚠️  Unrecognised input from Android: {raw!r}")
+                self._safe_send_android(f"ERROR: Unknown command: {raw}")
 
     # ── Thread: Send to STM32 and wait for ACK ────────────────────────────────
     def _thread_send_stm(self) -> None:
@@ -359,7 +369,7 @@ class DemoController:
             log.info(f"🚗  RPi → STM32:  {cmd}")
             try:
                 # Inform Android that the command is being sent
-                self._safe_send_android("info", f"Sent to STM32: {cmd}")
+                self._safe_send_android(f"Sent to STM32: {cmd}")
 
                 # Send command to STM32
                 self.stm.send(cmd)
@@ -369,20 +379,20 @@ class DemoController:
 
                 if ack and ack.upper().startswith("ACK"):
                     log.info(f"✅  STM32 ACK for: {cmd}")
-                    self._safe_send_android("info", f"ACK received for: {cmd}")
+                    self._safe_send_android(f"ACK received for: {cmd}")
                 else:
                     # No ACK within timeout – warn but keep going
                     log.warning(f"⚠️  No ACK (got {ack!r}) for: {cmd}")
-                    self._safe_send_android("error", f"STM32 did not ACK: {cmd}")
+                    self._safe_send_android(f"ERROR: STM32 did not ACK: {cmd}")
 
             except Exception as exc:
                 log.error(f"Error while sending {cmd!r} to STM32: {exc}")
-                self._safe_send_android("error", f"Serial error for {cmd}: {exc}")
+                self._safe_send_android(f"ERROR: Serial error for {cmd}: {exc}")
 
     # ── Helper: send to Android without crashing on disconnect ───────────────
-    def _safe_send_android(self, cat: str, value) -> None:
+    def _safe_send_android(self, text: str) -> None:
         try:
-            self.android.send(cat, value)
+            self.android.send(text)
         except OSError:
             log.warning("Could not send to Android (connection lost?)")
 
