@@ -17,8 +17,8 @@ FLOW
            BW{n}  → REV:{n}     (reverse n cm)
            FR00   → TURNR:90    (forward-right arc  = turn right 90°)
            FL00   → TURNL:90    (forward-left arc   = turn left 90°)
-           BR00   → TURNR:90    (backward-right arc = turn right 90°)
-           BL00   → TURNL:90    (backward-left arc  = turn left 90°)
+           BR00   → REVR:90     (backward-right arc, from movement.py)
+           BL00   → REVL:90     (backward-left  arc, from movement.py)
            TL{n}  → TURNL:90    (point turn left)
            TR{n}  → TURNR:90    (point turn right)
        • SNAP{id}[_signal]             → capture image, POST to /image,
@@ -145,10 +145,15 @@ ALGO_CMD_PREFIXES = (
 
 # STM32 text-format prefixes (already in the correct format, pass through)
 STM32_TEXT_PREFIXES = (
-    "FWD:", "REV:",           # straight motion
-    "TURNL:", "TURNR:",       # turns
-    "OLED:", "STOP", "RS",    # misc
+    "FWD:", "REV:",             # straight motion
+    "TURNL:", "TURNR:",         # point / forward-arc turns
+    "REVL:", "REVR:",           # backward-arc turns (e.g. REVL:90, REVR:90)
+    "OLED:", "STOP", "RS",      # misc
 )
+
+# STM32 acknowledgement prefixes – the firmware may reply with either "OK" or "ACK".
+# Both are treated as successful completion of the previous command.
+STM32_ACK_PREFIXES = ("OK", "ACK")
 
 # ─── Human-readable symbol names (for logging) ────────────────────────────────
 SYMBOL_MAP: Dict[str, str] = {
@@ -499,8 +504,8 @@ def convert_algo_to_stm32(algo_cmd: str) -> Optional[str]:
     BS{n}        │  REV:{n}             │  Backward step
     FR{p}        │  TURNR:{angle}       │  Forward-Right arc  = turn right
     FL{p}        │  TURNL:{angle}       │  Forward-Left  arc  = turn left
-    BR{p}        │  TURNR:{angle}       │  Backward-Right arc = turn right
-    BL{p}        │  TURNL:{angle}       │  Backward-Left  arc = turn left
+    BR{p}        │  REVR:{angle}        │  Backward-Right arc (movement.py: REVR)
+    BL{p}        │  REVL:{angle}        │  Backward-Left  arc (movement.py: REVL)
     TL{p}        │  TURNL:{angle}       │  Point turn left
     TR{p}        │  TURNR:{angle}       │  Point turn right
     FWD:* …      │  (pass through)      │  Already STM32 text format
@@ -530,13 +535,21 @@ def convert_algo_to_stm32(algo_cmd: str) -> Optional[str]:
             if n.isdigit():
                 return f"REV:{int(n)}"
 
-    # Arc turns
-    # FR = Forward-Right  |  BR = Backward-Right  →  TURNR:{angle}
-    # FL = Forward-Left   |  BL = Backward-Left   →  TURNL:{angle}
-    if algo_cmd.startswith("FR") or algo_cmd.startswith("BR"):
+    # Forward arc turns
+    # FR = Forward-Right  →  TURNR:{angle}
+    # FL = Forward-Left   →  TURNL:{angle}
+    if algo_cmd.startswith("FR"):
         return f"TURNR:{ARC_TURN_ANGLE}"
-    if algo_cmd.startswith("FL") or algo_cmd.startswith("BL"):
+    if algo_cmd.startswith("FL"):
         return f"TURNL:{ARC_TURN_ANGLE}"
+
+    # Backward arc turns (movement.py pattern: REVL / REVR)
+    # BR = Backward-Right  →  REVR:{angle}
+    # BL = Backward-Left   →  REVL:{angle}
+    if algo_cmd.startswith("BR"):
+        return f"REVR:{ARC_TURN_ANGLE}"
+    if algo_cmd.startswith("BL"):
+        return f"REVL:{ARC_TURN_ANGLE}"
 
     # Point turns
     if algo_cmd.startswith("TL"):
@@ -794,13 +807,13 @@ class MainRunner:
 
           SNAP{id}[_signal]   →  capture + recognise image, store result
           FIN                 →  send STOP to STM32, break
-          Algo-format motion  →  convert to STM32 text, send, wait ACK
-              FW{n} → FWD:{n}   BW{n} → REV:{n}
-              FR00  → TURNR:90  FL00  → TURNL:90
-              BR00  → TURNR:90  BL00  → TURNL:90
-              TL00  → TURNL:90  TR00  → TURNR:90
-          STM32-text motion   →  pass through, send, wait ACK
-              FWD:*  REV:*  TURNL:*  TURNR:*  OLED:*  STOP  RS
+          Algo-format motion  →  convert to STM32 text, send, wait OK/ACK
+              FW{n} → FWD:{n}    BW{n} → REV:{n}
+              FR00  → TURNR:90   FL00  → TURNL:90
+              BR00  → REVR:90    BL00  → REVL:90
+              TL00  → TURNL:90   TR00  → TURNR:90
+          STM32-text motion   →  pass through, send, wait OK/ACK
+              FWD:*  REV:*  TURNL:*  TURNR:*  REVL:*  REVR:*  OLED:*  STOP  RS
           Unknown             →  log warning, skip
         """
         total = len(commands)
@@ -881,11 +894,16 @@ class MainRunner:
             "signal":      signal,
         })
 
-    # ── Send STM32 command and wait for ACK ───────────────────────────────────
+    # ── Send STM32 command and wait for OK / ACK ──────────────────────────────
     def _send_stm_and_wait_ack(self, cmd: str) -> None:
         """
-        Send one motion command to the STM32 over serial and block until
-        an 'ACK' reply arrives (or STM_ACK_TIMEOUT seconds elapse).
+        Send one STM32 text-format command over serial and block until the
+        firmware replies with a line starting with "OK" or "ACK"
+        (both are accepted, matching movement.py behaviour).
+
+        Uses ser.in_waiting polling (non-blocking reads) so the loop doesn't
+        stall the serial port between bytes.  Falls through after
+        STM_ACK_TIMEOUT seconds with a warning.
         """
         try:
             self.stm.send(cmd)
@@ -893,19 +911,26 @@ class MainRunner:
             log.error(f"STM32 send failed for {cmd!r}: {exc}")
             return
 
+        ser = self.stm._ser          # direct access for in_waiting check
         deadline = time.time() + STM_ACK_TIMEOUT
+
         while time.time() < deadline:
-            msg = self.stm.recv()
-            if msg is None:
-                continue
-            if msg.upper().startswith("ACK"):
-                log.info(f"✅  ACK received for: {cmd}")
-                return
+            if ser is None or not ser.is_open:
+                break
+            if ser.in_waiting:
+                raw  = ser.readline()
+                line = raw.strip().decode("utf-8", errors="ignore")
+                log.debug(f"← STM32: {line!r}")
+                if any(line.upper().startswith(pfx) for pfx in STM32_ACK_PREFIXES):
+                    log.info(f"✅  STM32 OK for: {cmd!r}  (reply: {line!r})")
+                    return
+                # Non-OK lines (status messages etc.) are logged but don't stop the wait
+                log.debug(f"STM32 non-OK while waiting for {cmd!r}: {line!r}")
             else:
-                log.debug(f"STM32 non-ACK while waiting: {msg!r}")
+                time.sleep(0.005)   # 5 ms yield to avoid busy-spinning
 
         log.warning(
-            f"⚠️  No ACK within {STM_ACK_TIMEOUT:.0f}s for command {cmd!r} — continuing."
+            f"⚠️  No OK/ACK within {STM_ACK_TIMEOUT:.0f}s for {cmd!r} — continuing."
         )
 
     # ── Report final results to Android ───────────────────────────────────────
