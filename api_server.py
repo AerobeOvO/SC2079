@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
 API Server for Robot Navigation System
-- Image recognition using YOLO model
-- Path planning (to be implemented)
-- Image stitching (to be implemented)
+- Image recognition using YOLO model  (POST /image, POST /image-new)
+- Path planning via MazeSolver A* + TSP  (POST /path)
+- Image stitching  (GET /stitch)
 """
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import json
+import io
 import os
 import sys
 import tempfile
 from pathlib import Path
+from datetime import datetime
 import numpy as np
 from PIL import Image, ImageEnhance
 import cv2
@@ -19,7 +22,7 @@ import time
 
 # Add ModelTraining and Algorithm directories to path
 model_dir = Path(__file__).parent.parent / 'ModelTraining'
-algo_dir = Path(__file__).parent.parent / 'Algorithm'
+algo_dir = Path(__file__).parent.parent / 'Algo' / 'Algorithm'
 sys.path.insert(0, str(model_dir))
 sys.path.insert(0, str(algo_dir))
 
@@ -43,6 +46,7 @@ except ImportError as e:
     ALGO_AVAILABLE = False
 
 app = Flask(__name__)
+CORS(app)
 
 # Global variables for model (loaded once at startup)
 MODEL = None
@@ -448,6 +452,93 @@ def path_planning():
             }
         }), 500
 
+@app.route('/image-new', methods=['POST'])
+def predict_image_new():
+    """
+    Image detection endpoint (from Algo/Algorithm/main.py).
+    Saves the original upload and an annotated result image to disk.
+    Expected: multipart/form-data with 'file' field
+    Optional form field: 'confidence' (float, default 0.25)
+    Returns: {
+        "success": bool,
+        "count": int,
+        "detections": [{"class": str, "confidence": float}, ...],
+        "result_image": str   # path to annotated image saved on server
+    }
+    """
+    if not YOLO_AVAILABLE or MODEL is None:
+        return jsonify({"error": "Model not available"}), 500
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+
+    # Read file content once
+    file_content = file.read()
+
+    # Save original image to uploads folder (relative to server working dir)
+    uploads_dir = Path(__file__).parent / 'uploads'
+    uploads_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename_without_ext = os.path.splitext(file.filename)[0]
+    file_ext = os.path.splitext(file.filename)[1]
+    upload_path = uploads_dir / f'{timestamp}_{filename_without_ext}{file_ext}'
+    with open(upload_path, 'wb') as f:
+        f.write(file_content)
+
+    # Get confidence threshold from request, default to 0.25
+    confidence = float(request.form.get('confidence', 0.25))
+
+    # Convert file bytes to PIL Image and run prediction
+    image = Image.open(io.BytesIO(file_content))
+    results = MODEL.predict(
+        source=image,
+        conf=confidence,
+        save=False
+    )
+
+    # Get annotated image with bounding boxes drawn
+    annotated_img = results[0].plot()
+
+    # Save annotated result image
+    results_dir = Path(__file__).parent / 'own_results'
+    results_dir.mkdir(exist_ok=True)
+    output_path = results_dir / f'result_{timestamp}_{filename_without_ext}.jpg'
+    cv2.imwrite(str(output_path), annotated_img)
+
+    # Build detection list
+    boxes = results[0].boxes
+    detections = []
+    if len(boxes) > 0:
+        for box in boxes:
+            cls_idx = int(box.cls.cpu().numpy()[0])
+            conf = float(box.conf.cpu().numpy()[0])
+            detections.append({
+                "class": CLASS_NAMES[cls_idx],
+                "confidence": conf
+            })
+        result = {
+            "success": True,
+            "count": len(boxes),
+            "detections": detections,
+            "result_image": str(output_path)
+        }
+    else:
+        result = {
+            "success": False,
+            "count": 0,
+            "detections": [],
+            "message": "No objects detected. Try lowering the confidence threshold.",
+            "result_image": str(output_path)
+        }
+
+    return jsonify(result), 200
+
+
 @app.route('/stitch', methods=['GET'])
 def stitch():
     """Image stitching endpoint"""
@@ -479,10 +570,11 @@ def main():
     print(f"  Model Loaded: {MODEL is not None}")
     print(f"  Algorithm Available: {ALGO_AVAILABLE}")
     print("\nEndpoints:")
-    print("  GET  /status  - Health check")
-    print("  POST /image   - Image recognition (YOLO)")
-    print("  POST /path    - Path planning (A* + TSP)")
-    print("  GET  /stitch  - Image stitching")
+    print("  GET  /status     - Health check")
+    print("  POST /image      - Image recognition (YOLO + preprocessing + filtering)")
+    print("  POST /image-new  - Image recognition (YOLO, saves annotated result to disk)")
+    print("  POST /path       - Path planning (A* + TSP via MazeSolver)")
+    print("  GET  /stitch     - Image stitching")
     print("="*60)
     print("\nServer starting...\n")
     
