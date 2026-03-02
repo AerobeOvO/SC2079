@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""
+main_runner.py  –  SC2079 Full Navigation + Image Recognition Runner
+=====================================================================
+
+FLOW
+────
+  1. Connect to STM32 via serial (UART).
+  2. Wait for Android tablet to connect via Bluetooth.
+  3. Receive obstacle JSON from Android:
+       {"cat": "obstacles", "value": [{"x":4,"y":13,"id":2,"d":2}, ...]}
+  4. POST obstacles to API server (/path) → receive optimal command list
+     (A* path-finding + TSP ordering via MazeSolver).
+  5. Execute each command in order:
+       • STM32 motion  (FW/BW/FL/FR …) → send over serial, wait for ACK
+       • SNAP{id}[_signal]             → capture image, POST to /image,
+                                         store recognised class_id
+       • FIN                           → stop, report results to Android
+  6. Send final image-recognition summary back to Android.
+
+ANDROID JSON FORMAT
+───────────────────
+  Inbound (Android → RPi):
+    {"cat": "obstacles",
+     "value": [{"x": int, "y": int, "id": int, "d": int}, ...]}
+
+  Direction 'd' mapping:
+    0 = North  |  1 = East  |  2 = South  |  3 = West
+
+  Outbound (RPi → Android):
+    {"cat": "info",    "value": "<message>"}
+    {"cat": "path",    "value": {"commands": [...], "distance": float, "path": [...]}}
+    {"cat": "snap",    "value": "<status message>"}
+    {"cat": "result",  "value": {"obstacle_id": int, "image_id": str, "signal": str}}
+    {"cat": "results", "value": [{"obstacle_id": int, "image_id": str}, ...]}
+    {"cat": "error",   "value": "<error message>"}
+
+CONFIGURATION
+─────────────
+  Edit settings.py for API_IP, API_PORT, SERIAL_PORT, BAUD_RATE.
+  IMAGE_REC_DISTANCE (25 cm) is the target robot-to-obstacle viewing distance;
+  the MazeSolver positions the robot at the closest feasible grid cell (~30 cm).
+
+USAGE (on Raspberry Pi)
+───────────────────────
+  cd /path/to/SC2079
+  python3 main_runner.py
+
+Press Ctrl+C to quit cleanly.
+"""
+
+import bluetooth
+import json
+import os
+import requests
+import serial
+import sys
+import time
+from typing import Dict, List, Optional
+
+# ─── Make project root importable ─────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from settings import API_IP, API_PORT, SERIAL_PORT, BAUD_RATE
+from logger import prepare_logger
+
+# ─── Logger ───────────────────────────────────────────────────────────────────
+log = prepare_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Bluetooth service identifiers (must match Android app's UUID)
+BT_SERVICE_NAME = "MDP-RPi-Runner"
+BT_UUID         = "94f39d29-7d6d-437d-973b-fba39e49d4ee"
+
+# Target robot-to-obstacle distance for image capture (centimetres).
+# The MazeSolver places the robot at the nearest valid grid cell (~30 cm).
+IMAGE_REC_DISTANCE = 25
+
+# Robot starting state on the 20×20 arena grid
+ROBOT_START_X   = 1    # grid units (bottom-left corner)
+ROBOT_START_Y   = 1
+ROBOT_START_DIR = 0    # Direction.NORTH in algo convention (0=N, 2=E, 4=S, 6=W)
+
+# How long to wait for a STM32 ACK before moving on (seconds)
+STM_ACK_TIMEOUT = 15.0
+
+# Max capture + recognition attempts per obstacle before giving up
+MAX_SNAP_ATTEMPTS = 6
+
+# When True the script loops indefinitely: after each run finishes (or fails)
+# it resets and waits for the next Android Bluetooth connection automatically.
+# Set to False to exit after a single run.
+AUTO_RESTART = True
+
+# Seconds to pause between runs before accepting the next connection
+RESTART_DELAY = 3.0
+
+# ─── Direction mapping ─────────────────────────────────────────────────────────
+# Android JSON 'd': 0=North  1=East  2=South  3=West
+# Algo Direction:   N=0       E=2      S=4      W=6
+ANDROID_TO_ALGO_DIR: Dict[int, int] = {0: 0, 1: 2, 2: 4, 3: 6}
+
+# ─── STM32 command prefix whitelist ───────────────────────────────────────────
+# All commands that start with one of these are forwarded verbatim to STM32.
+STM_PREFIXES = (
+    "FW", "BW", "FS", "BS",          # forward / backward (step / continuous)
+    "FL", "FR", "BL", "BR",          # diagonal / arc turns
+    "TL", "TR",                       # point turns
+    "FWD:", "REV:", "TURNL:", "TURNR:",  # rpi.py-style text commands
+    "OLED:", "STOP", "RS",           # misc
+)
+
+# ─── Human-readable symbol names (for logging) ────────────────────────────────
+SYMBOL_MAP: Dict[str, str] = {
+    "10": "Bullseye",
+    "11": "One",      "12": "Two",   "13": "Three", "14": "Four",
+    "15": "Five",     "16": "Six",   "17": "Seven", "18": "Eight", "19": "Nine",
+    "20": "A",  "21": "B",  "22": "C",  "23": "D",  "24": "E",
+    "25": "F",  "26": "G",  "27": "H",  "28": "S",  "29": "T",
+    "30": "U",  "31": "V",  "32": "W",  "33": "X",  "34": "Y",  "35": "Z",
+    "36": "Up Arrow",   "37": "Down Arrow",
+    "38": "Right Arrow","39": "Left Arrow",
+    "40": "Stop (Circle)",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANDROID BLUETOOTH LINK
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AndroidBT:
+    """
+    Bluetooth RFCOMM server.
+    Advertises a service and waits for the Android tablet to connect.
+    All messages are newline-delimited UTF-8 text (typically JSON).
+    """
+
+    def __init__(self) -> None:
+        self._server: Optional[bluetooth.BluetoothSocket] = None
+        self._client: Optional[bluetooth.BluetoothSocket] = None
+        self._buf: str = ""
+
+    # ── Connect ───────────────────────────────────────────────────────────────
+    def connect(self) -> None:
+        log.info("Making RPi Bluetooth-discoverable …")
+        os.system("sudo hciconfig hci0 piscan")
+
+        self._server = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+        self._server.bind(("", bluetooth.PORT_ANY))
+        self._server.listen(1)
+        port = self._server.getsockname()[1]
+
+        bluetooth.advertise_service(
+            self._server,
+            BT_SERVICE_NAME,
+            service_id=BT_UUID,
+            service_classes=[BT_UUID, bluetooth.SERIAL_PORT_CLASS],
+            profiles=[bluetooth.SERIAL_PORT_PROFILE],
+        )
+
+        log.info(f"📡  Waiting for Android on RFCOMM channel {port} …")
+        log.info(f"     Service: {BT_SERVICE_NAME}  |  UUID: {BT_UUID}")
+        self._client, info = self._server.accept()
+        log.info(f"✅  Android connected from {info}")
+
+    # ── Send ──────────────────────────────────────────────────────────────────
+    def send(self, text: str) -> None:
+        """Send a newline-terminated UTF-8 text line to Android."""
+        msg = text.rstrip("\n") + "\n"
+        try:
+            self._client.send(msg.encode("utf-8"))
+            log.debug(f"→ Android: {msg.strip()!r}")
+        except OSError as exc:
+            log.error(f"BT send error: {exc}")
+
+    # ── Receive ───────────────────────────────────────────────────────────────
+    def recv(self) -> Optional[str]:
+        """
+        Return the next non-empty line from Android.
+        Buffers partial reads internally.
+        Raises OSError if the connection is closed.
+        """
+        while True:
+            if "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                line = line.strip()
+                if line:
+                    log.debug(f"← Android: {line!r}")
+                    return line
+                continue
+            chunk = self._client.recv(4096)
+            if not chunk:
+                raise OSError("Android socket closed (empty recv)")
+            self._buf += chunk.decode("utf-8", errors="ignore")
+
+    # ── Disconnect ────────────────────────────────────────────────────────────
+    def close(self) -> None:
+        for sock in (self._client, self._server):
+            try:
+                if sock:
+                    sock.close()
+            except Exception as exc:
+                log.warning(f"BT close warning: {exc}")
+        log.info("Bluetooth closed.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STM32 SERIAL LINK
+# ══════════════════════════════════════════════════════════════════════════════
+
+class STMSerial:
+    """
+    Thin wrapper around pyserial for talking to the STM32 over UART.
+    Commands are CR+LF-terminated; STM32 replies with lines starting with 'ACK'.
+    """
+
+    def __init__(self) -> None:
+        self._ser: Optional[serial.Serial] = None
+
+    # ── Connect ───────────────────────────────────────────────────────────────
+    def connect(self) -> None:
+        log.info(f"Opening serial port {SERIAL_PORT} @ {BAUD_RATE} baud …")
+        self._ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=STM_ACK_TIMEOUT)
+        time.sleep(2)                       # allow STM32 to finish reset
+        self._ser.reset_input_buffer()
+        log.info("✅  STM32 serial connected.")
+
+    # ── Send ──────────────────────────────────────────────────────────────────
+    def send(self, cmd: str) -> None:
+        if self._ser is None or not self._ser.is_open:
+            raise RuntimeError("STM32 serial port is not open.")
+        payload = (cmd + "\r\n").encode("utf-8")
+        log.debug(f"→ STM32: {cmd!r}")
+        self._ser.write(payload)
+        self._ser.flush()
+
+    # ── Receive ───────────────────────────────────────────────────────────────
+    def recv(self) -> Optional[str]:
+        """
+        Read one line from STM32 (blocks up to STM_ACK_TIMEOUT seconds).
+        Returns the decoded string, or None on timeout / empty read.
+        """
+        if self._ser is None or not self._ser.is_open:
+            return None
+        raw = self._ser.readline()
+        if raw:
+            decoded = raw.strip().decode("utf-8", errors="ignore")
+            log.debug(f"← STM32: {decoded!r}")
+            return decoded
+        return None
+
+    # ── Disconnect ────────────────────────────────────────────────────────────
+    def close(self) -> None:
+        if self._ser and self._ser.is_open:
+            self._ser.close()
+            log.info("STM32 serial closed.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATH PLANNING  (via API server /path endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plan_path(obstacles_android: List[dict]) -> Optional[dict]:
+    """
+    Convert Android-format obstacles to algo-format, POST to /path, return result.
+
+    Android obstacle: {"x": int, "y": int, "id": int, "d": int (0–3)}
+    Algo obstacle:    {"x": int, "y": int, "id": int, "d": int (0,2,4,6)}
+
+    Returns the full API response dict on success, or None on failure.
+    """
+    # Remap direction values: Android 0-3  →  Algo 0/2/4/6
+    algo_obstacles = [
+        {
+            "x":  int(ob["x"]),
+            "y":  int(ob["y"]),
+            "id": int(ob["id"]),
+            "d":  ANDROID_TO_ALGO_DIR.get(int(ob["d"]), 0),
+        }
+        for ob in obstacles_android
+    ]
+
+    payload = {
+        "obstacles": algo_obstacles,
+        "robot_x":   ROBOT_START_X,
+        "robot_y":   ROBOT_START_Y,
+        "robot_dir": ROBOT_START_DIR,
+        "big_turn":  "0",
+        "retrying":  False,
+    }
+
+    url = f"http://{API_IP}:{API_PORT}/path"
+    log.info(f"Requesting path from {url}  ({len(algo_obstacles)} obstacle(s)) …")
+    log.debug(f"Path payload: {json.dumps(payload, indent=2)}")
+
+    try:
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            cmds = data.get("data", {}).get("commands", [])
+            dist = data.get("data", {}).get("distance", 0)
+            log.info(f"✅  Path received: {len(cmds)} command(s), distance={dist:.1f} units")
+            return data
+        else:
+            log.error(f"Path API HTTP {resp.status_code}: {resp.text[:300]}")
+            return None
+
+    except requests.exceptions.Timeout:
+        log.error("Path API timed out (>60 s).")
+        return None
+    except requests.exceptions.ConnectionError as exc:
+        log.error(f"Path API connection error: {exc}")
+        return None
+    except Exception as exc:
+        log.error(f"Path API unexpected error: {exc}", exc_info=True)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE CAPTURE  (PiCamera)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def capture_image(filename: str, attempt: int = 1) -> None:
+    """
+    Capture a JPEG image using the legacy picamera module.
+
+    'attempt' drives exposure bracketing:
+      attempts 1-3: progressively brighter (longer shutter, positive EV)
+      attempts 4+:  progressively darker  (shorter shutter, negative EV)
+
+    Raises RuntimeError if picamera is not installed.
+    """
+    try:
+        import picamera                       # type: ignore  (RPi only)
+    except ImportError:
+        raise RuntimeError(
+            "The 'picamera' package is not installed. "
+            "Run this script on a Raspberry Pi with picamera enabled."
+        )
+
+    if attempt <= 3:
+        shutter_us = min(1_000_000, 10_000 * (2 ** (attempt - 1)))
+        ev_comp    = min(6, 2 * attempt)
+        iso_value  = 200
+    else:
+        factor     = max(1, 2 ** (attempt - 3))
+        shutter_us = max(1_000, 10_000 // factor)
+        ev_comp    = -min(6, 2 * (attempt - 3))
+        iso_value  = 100
+
+    with picamera.PiCamera() as cam:
+        cam.resolution            = (1280, 960)
+        cam.framerate             = 30
+        cam.iso                   = iso_value
+        cam.exposure_mode         = "auto"
+        cam.awb_mode              = "auto"
+        cam.exposure_compensation = ev_comp
+        time.sleep(0.4)                       # let auto-gain settle
+        cam.shutter_speed = shutter_us
+        time.sleep(0.1)                       # apply new shutter
+        cam.capture(filename, format="jpeg", quality=85)
+
+    log.info(f"📸  Captured → {filename}  (attempt {attempt}, ev={ev_comp}, shutter={shutter_us}µs)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE RECOGNITION  (via API server /image endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_image_to_api(filename: str) -> str:
+    """
+    POST a JPEG file to the /image endpoint and return the top class_id string.
+    Returns "NA" on API error or no detection.
+    """
+    url = f"http://{API_IP}:{API_PORT}/image"
+    try:
+        with open(filename, "rb") as f:
+            resp = requests.post(
+                url,
+                files={"file": (os.path.basename(filename), f)},
+                timeout=30,
+            )
+        if resp.status_code == 200:
+            data     = resp.json()
+            segments = data.get("segments", [])
+            if segments:
+                # Sort by confidence descending; take the top result
+                segments.sort(key=lambda s: s.get("confidence", 0), reverse=True)
+                top      = segments[0]
+                img_id   = str(top.get("class_id", "NA"))
+                conf     = top.get("confidence", 0)
+                sym_name = SYMBOL_MAP.get(img_id, top.get("class_name", "Unknown"))
+                log.info(f"🔍  Recognised: {sym_name} (class_id={img_id}, conf={conf*100:.1f}%)")
+                return img_id
+            else:
+                log.info("🔍  No object detected in image.")
+                return "NA"
+        else:
+            log.error(f"Image API HTTP {resp.status_code}: {resp.text[:200]}")
+            return "NA"
+
+    except requests.exceptions.Timeout:
+        log.error("Image API timed out (>30 s).")
+        return "NA"
+    except Exception as exc:
+        log.error(f"Image API error: {exc}", exc_info=True)
+        return "NA"
+
+
+def recognise_obstacle(obstacle_id: int, signal: str) -> str:
+    """
+    Capture image (with up to MAX_SNAP_ATTEMPTS retries) and return the
+    recognised class_id string, or "NA" if nothing valid is found.
+
+    Filename format:  <unix_timestamp>_<obstacle_id>_<signal>.jpg
+    This matches what api_server.py expects for obstacle_id extraction.
+    """
+    VALID_IDS = {str(i) for i in range(11, 41)}   # 11–40 are valid symbol IDs
+    img_id    = "NA"
+
+    for attempt in range(1, MAX_SNAP_ATTEMPTS + 1):
+        filename = f"{int(time.time())}_{obstacle_id}_{signal}.jpg"
+
+        try:
+            capture_image(filename, attempt)
+        except RuntimeError as exc:
+            log.error(f"Capture failed: {exc}")
+            break                                  # no point retrying without camera
+
+        img_id = send_image_to_api(filename)
+
+        if img_id in VALID_IDS:
+            log.info(f"✅  Obstacle {obstacle_id}: recognised image_id={img_id} on attempt {attempt}")
+            return img_id
+
+        log.info(
+            f"↩️   Obstacle {obstacle_id}: attempt {attempt}/{MAX_SNAP_ATTEMPTS} → "
+            f"got {img_id!r} (not a valid symbol) — retrying …"
+        )
+
+    log.warning(f"⚠️  Obstacle {obstacle_id}: gave up after {MAX_SNAP_ATTEMPTS} attempts — returning {img_id!r}")
+    return img_id
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MainRunner:
+    """
+    Orchestrates the complete SC2079 task:
+      Android BT  →  parse obstacles  →  path plan (API)
+      →  execute STM32 commands  →  image recognition (API)
+      →  report results to Android
+    """
+
+    def __init__(self) -> None:
+        self.android = AndroidBT()
+        self.stm     = STMSerial()
+        # Stores image-recognition results: obstacle_id → class_id string
+        self.results: Dict[int, str] = {}
+
+    # ── Entry point (outer loop) ──────────────────────────────────────────────
+    def start(self) -> None:
+        """
+        Main entry point.
+
+        When AUTO_RESTART=True (default) the runner loops indefinitely:
+          boot  →  connect STM32  →  wait for Android  →  receive JSON
+               →  plan path  →  execute  →  report  →  reset  →  repeat
+
+        This means the script is *always* waiting for Android as soon as the
+        RPi finishes one run (or encounters an error), with no manual restart
+        needed.  Press Ctrl+C to stop cleanly.
+        """
+        log.info("=" * 62)
+        log.info("  SC2079 Main Runner  –  Navigation + Image Recognition")
+        log.info("=" * 62)
+        log.info(f"  API server   :  http://{API_IP}:{API_PORT}")
+        log.info(f"  STM32 port   :  {SERIAL_PORT}  @  {BAUD_RATE} baud")
+        log.info(f"  Image dist   :  {IMAGE_REC_DISTANCE} cm (target viewing distance)")
+        log.info(f"  Robot start  :  ({ROBOT_START_X}, {ROBOT_START_Y}) facing North")
+        log.info(f"  Auto-restart :  {AUTO_RESTART}")
+        log.info("=" * 62)
+
+        run_count = 0
+        try:
+            while True:
+                run_count += 1
+                if run_count > 1:
+                    log.info(
+                        f"🔄  Auto-restart in {RESTART_DELAY:.0f}s "
+                        f"(run #{run_count}) …"
+                    )
+                    time.sleep(RESTART_DELAY)
+
+                should_continue = self._run_once()
+
+                if not should_continue:
+                    # Ctrl+C was raised inside _run_once()
+                    break
+                if not AUTO_RESTART:
+                    log.info("AUTO_RESTART=False — exiting after single run.")
+                    break
+
+        except KeyboardInterrupt:
+            log.info("\nCtrl+C received at outer loop — shutting down.")
+        finally:
+            log.info("Runner stopped.")
+
+    # ── Single-run logic ──────────────────────────────────────────────────────
+    def _run_once(self) -> bool:
+        """
+        Execute one full task cycle:
+          connect STM32  →  wait for Android + obstacle JSON
+          →  path plan  →  execute commands  →  report results  →  cleanup
+
+        Returns True  if the run completed normally (success or error)
+                      so the caller can restart.
+        Returns False if Ctrl+C was pressed (caller should stop looping).
+        """
+        # Reset per-run state
+        self.results   = {}
+        self.android   = AndroidBT()
+        self.stm       = STMSerial()
+
+        try:
+            # Step 1 – Open STM32 serial connection
+            self.stm.connect()
+
+            # Step 2 – Verify API server is reachable
+            self._check_api()
+
+            # Step 3 – Wait for Android Bluetooth connection
+            self.android.connect()
+            self._bt_send_json("info", "Connected to RPi. Please send obstacle data.")
+
+            # Step 4 – Receive and parse obstacle JSON
+            # The runner blocks here automatically until Android sends the JSON.
+            obstacles = self._recv_obstacles()
+            if not obstacles:
+                log.error("No valid obstacles received — aborting this run.")
+                self._bt_send_json("error", "No obstacles received.")
+                return True   # allow restart
+
+            log.info(f"Received {len(obstacles)} obstacle(s):")
+            for ob in obstacles:
+                dir_name = {0: "N", 1: "E", 2: "S", 3: "W"}.get(ob["d"], "?")
+                log.info(f"  id={ob['id']:2d}  pos=({ob['x']:2d},{ob['y']:2d})  face={dir_name}")
+
+            self._bt_send_json(
+                "info",
+                f"Received {len(obstacles)} obstacle(s). Computing optimal path …"
+            )
+
+            # Step 5 – Path planning via API
+            path_data = plan_path(obstacles)
+            if path_data is None:
+                log.error("Path planning failed — aborting this run.")
+                self._bt_send_json("error", "Path planning failed. Check API server.")
+                return True   # allow restart
+
+            commands: List[str] = path_data.get("data", {}).get("commands", [])
+            distance: float     = path_data.get("data", {}).get("distance", 0.0)
+            path_states: list   = path_data.get("data", {}).get("path", [])
+
+            log.info(
+                f"Path ready: {len(commands)} command(s), "
+                f"estimated distance={distance:.1f} units"
+            )
+
+            # Step 6 – Immediately relay full path info to Android
+            self._bt_send_json("path", {
+                "commands": commands,
+                "distance": distance,
+                "path":     path_states,
+            })
+
+            # Step 7 – Execute every command (motion + SNAP + FIN)
+            self._execute_commands(commands)
+
+            # Step 8 – Send consolidated results summary to Android
+            self._report_results()
+
+            return True   # completed normally — allow restart
+
+        except KeyboardInterrupt:
+            log.info("Ctrl+C inside run — stopping.")
+            return False  # signal outer loop to stop
+
+        except Exception as exc:
+            log.error(f"Unhandled error in run: {exc}", exc_info=True)
+            try:
+                self._bt_send_json("error", str(exc))
+            except Exception:
+                pass
+            return True   # allow restart after error
+
+        finally:
+            # Always clean up hardware handles at the end of a run
+            try:
+                self.stm.send("STOP")
+            except Exception:
+                pass
+            self.stm.close()
+            self.android.close()
+            log.info("Run cleanup complete.")
+
+    # ── Check API server health ────────────────────────────────────────────────
+    def _check_api(self) -> None:
+        url = f"http://{API_IP}:{API_PORT}/status"
+        log.info(f"Checking API server at {url} …")
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                st = resp.json()
+                log.info(
+                    f"✅  API running — "
+                    f"model={st.get('model')}  "
+                    f"yolo={st.get('yolo_available')}  "
+                    f"algo={st.get('algorithm_available')}"
+                )
+            else:
+                log.warning(f"API status endpoint returned HTTP {resp.status_code}")
+        except Exception as exc:
+            log.warning(f"API check failed ({exc}) — continuing anyway.")
+
+    # ── Receive obstacle JSON from Android ────────────────────────────────────
+    def _recv_obstacles(self) -> Optional[List[dict]]:
+        """
+        Block until Android sends a valid obstacle message:
+          {"cat": "obstacles", "value": [...]}
+
+        Each obstacle must have keys: x, y, id, d
+          d: 0=North  1=East  2=South  3=West
+        """
+        log.info("Waiting for obstacle JSON from Android …")
+
+        while True:
+            raw = self.android.recv()
+            if raw is None:
+                continue
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(f"Non-JSON message ignored: {raw!r}")
+                continue
+
+            cat = str(msg.get("cat", "")).lower()
+            if cat != "obstacles":
+                log.info(f"Ignoring message with cat={cat!r} (waiting for 'obstacles')")
+                continue
+
+            value = msg.get("value")
+            if not isinstance(value, list) or len(value) == 0:
+                log.warning("Obstacle 'value' is empty or not a list — waiting again.")
+                continue
+
+            valid_obs: List[dict] = []
+            for item in value:
+                if all(k in item for k in ("x", "y", "id", "d")):
+                    try:
+                        valid_obs.append({
+                            "x":  int(item["x"]),
+                            "y":  int(item["y"]),
+                            "id": int(item["id"]),
+                            "d":  int(item["d"]),
+                        })
+                    except (ValueError, TypeError) as exc:
+                        log.warning(f"Skipping obstacle with invalid values {item}: {exc}")
+                else:
+                    log.warning(f"Skipping malformed obstacle entry: {item}")
+
+            if valid_obs:
+                return valid_obs
+            else:
+                log.warning("No valid obstacle entries found in message — waiting again.")
+
+    # ── Execute full command list ──────────────────────────────────────────────
+    def _execute_commands(self, commands: List[str]) -> None:
+        """
+        Iterate through every command from the path planner:
+          • STM32 motion commands  → forward to STM32, wait for ACK
+          • SNAP{id}[_signal]      → capture + recognise image, store result
+          • FIN                    → send STOP to STM32, break out of loop
+          • Unknown                → log warning, skip
+        """
+        total = len(commands)
+        log.info(f"Starting execution of {total} command(s) …")
+
+        for idx, cmd in enumerate(commands, 1):
+            log.info(f"[{idx:3d}/{total}]  {cmd}")
+
+            if cmd.startswith("SNAP"):
+                self._handle_snap(cmd)
+
+            elif cmd == "FIN":
+                log.info("FIN command reached — navigation complete.")
+                try:
+                    self.stm.send("STOP")
+                except Exception:
+                    pass
+                break
+
+            elif any(cmd.startswith(pfx) for pfx in STM_PREFIXES):
+                self._send_stm_and_wait_ack(cmd)
+
+            else:
+                log.warning(f"Unknown command skipped: {cmd!r}")
+
+        log.info("Command execution finished.")
+
+    # ── Handle SNAP command ────────────────────────────────────────────────────
+    def _handle_snap(self, snap_cmd: str) -> None:
+        """
+        Parse the SNAP command, capture + recognise the image, and store the result.
+
+        Expected formats:
+          SNAP{obstacle_id}           e.g.  SNAP3
+          SNAP{obstacle_id}_{signal}  e.g.  SNAP3_C   SNAP3_L   SNAP3_R
+        """
+        body = snap_cmd[4:]        # strip leading 'SNAP'
+
+        if "_" in body:
+            parts, signal = body.split("_", 1), body.split("_", 1)[1]
+            obstacle_id_str = body.split("_", 1)[0]
+        else:
+            obstacle_id_str = body
+            signal          = "C"    # default centre signal
+
+        try:
+            obstacle_id = int(obstacle_id_str)
+        except ValueError:
+            log.error(f"Cannot parse obstacle_id from SNAP command: {snap_cmd!r}")
+            return
+
+        log.info(f"📷  SNAP  obstacle_id={obstacle_id}  signal={signal}")
+        self._bt_send_json("snap", f"Capturing image for obstacle {obstacle_id} (signal={signal}) …")
+
+        img_id   = recognise_obstacle(obstacle_id, signal)
+        sym_name = SYMBOL_MAP.get(img_id, img_id)
+
+        self.results[obstacle_id] = img_id
+        log.info(f"🏷️   Obstacle {obstacle_id}  →  {sym_name} (class_id={img_id})")
+
+        # Send individual result to Android immediately
+        self._bt_send_json("result", {
+            "obstacle_id": obstacle_id,
+            "image_id":    img_id,
+            "image_name":  sym_name,
+            "signal":      signal,
+        })
+
+    # ── Send STM32 command and wait for ACK ───────────────────────────────────
+    def _send_stm_and_wait_ack(self, cmd: str) -> None:
+        """
+        Send one motion command to the STM32 over serial and block until
+        an 'ACK' reply arrives (or STM_ACK_TIMEOUT seconds elapse).
+        """
+        try:
+            self.stm.send(cmd)
+        except Exception as exc:
+            log.error(f"STM32 send failed for {cmd!r}: {exc}")
+            return
+
+        deadline = time.time() + STM_ACK_TIMEOUT
+        while time.time() < deadline:
+            msg = self.stm.recv()
+            if msg is None:
+                continue
+            if msg.upper().startswith("ACK"):
+                log.info(f"✅  ACK received for: {cmd}")
+                return
+            else:
+                log.debug(f"STM32 non-ACK while waiting: {msg!r}")
+
+        log.warning(
+            f"⚠️  No ACK within {STM_ACK_TIMEOUT:.0f}s for command {cmd!r} — continuing."
+        )
+
+    # ── Report final results to Android ───────────────────────────────────────
+    def _report_results(self) -> None:
+        """Send a consolidated summary of all image-recognition results to Android."""
+        log.info("=" * 44)
+        log.info("FINAL IMAGE RECOGNITION RESULTS")
+        log.info("=" * 44)
+
+        summary = []
+        for ob_id, img_id in sorted(self.results.items()):
+            sym_name = SYMBOL_MAP.get(img_id, img_id)
+            log.info(f"  Obstacle {ob_id:2d}  →  {sym_name:20s} (class_id={img_id})")
+            summary.append({
+                "obstacle_id": ob_id,
+                "image_id":    img_id,
+                "image_name":  sym_name,
+            })
+
+        log.info("=" * 44)
+        self._bt_send_json("results", summary)
+        log.info("✅  Task complete — results sent to Android.")
+
+    # ── Helper: send JSON to Android ──────────────────────────────────────────
+    def _bt_send_json(self, cat: str, value) -> None:
+        """Serialise and send a {"cat": cat, "value": value} message to Android."""
+        try:
+            self.android.send(json.dumps({"cat": cat, "value": value}))
+        except OSError:
+            log.warning("Could not send to Android (connection lost?).")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    runner = MainRunner()
+    runner.start()
