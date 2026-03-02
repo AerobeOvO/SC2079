@@ -934,25 +934,70 @@ class MainRunner:
         )
 
     # ── Report final results to Android ───────────────────────────────────────
-    def _report_results(self) -> None:
-        """Send a consolidated summary of all image-recognition results to Android."""
-        log.info("=" * 44)
-        log.info("FINAL IMAGE RECOGNITION RESULTS")
-        log.info("=" * 44)
+    def _report_results(self) -> List[dict]:
+        """
+        Print the final image-recognition results to the terminal and send them
+        to Android as a single JSON message.
+
+        Terminal output format:
+          ════════════════════════════════════════════════════
+           FINAL RESULTS  –  Image Recognition Complete
+          ════════════════════════════════════════════════════
+           Obstacle  6  →  [20] A
+           Obstacle  5  →  [14] Four
+           Obstacle  7  →  [11] One
+           Obstacle  4  →  [36] Up Arrow
+          ════════════════════════════════════════════════════
+           4 obstacle(s) processed.
+          ════════════════════════════════════════════════════
+
+        Android JSON:
+          {"cat": "results",
+           "value": [{"obstacle_id": int, "image_id": str, "image_name": str}, ...]}
+
+        Returns the summary list (also stored in self.results).
+        """
+        div = "═" * 52
+
+        # ── Terminal / log ─────────────────────────────────────────────────────
+        print(f"\n{div}")
+        print("  FINAL RESULTS  –  Image Recognition Complete")
+        print(div)
+        log.info(div)
+        log.info("  FINAL RESULTS  –  Image Recognition Complete")
+        log.info(div)
 
         summary = []
         for ob_id, img_id in sorted(self.results.items()):
             sym_name = SYMBOL_MAP.get(img_id, img_id)
-            log.info(f"  Obstacle {ob_id:2d}  →  {sym_name:20s} (class_id={img_id})")
+            line = f"  Obstacle {ob_id:2d}  →  [{img_id:>3}] {sym_name}"
+            print(line)
+            log.info(line)
             summary.append({
                 "obstacle_id": ob_id,
                 "image_id":    img_id,
                 "image_name":  sym_name,
             })
 
-        log.info("=" * 44)
+        print(div)
+        print(f"  {len(summary)} obstacle(s) processed.")
+        print(f"{div}\n")
+        log.info(div)
+        log.info(f"  {len(summary)} obstacle(s) processed.")
+        log.info(div)
+
+        # ── Send to Android ────────────────────────────────────────────────────
         self._bt_send_json("results", summary)
-        log.info("✅  Task complete — results sent to Android.")
+        log.info("✅  Results sent to Android.")
+
+        # ── Also print the raw JSON to stdout for easy copy-paste / debugging ──
+        import json as _json
+        print("  Android payload:")
+        print("  " + _json.dumps({"cat": "results", "value": summary}, indent=2)
+              .replace("\n", "\n  "))
+        print()
+
+        return summary
 
     # ── Helper: send JSON to Android ──────────────────────────────────────────
     def _bt_send_json(self, cat: str, value) -> None:
