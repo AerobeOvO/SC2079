@@ -448,8 +448,12 @@ def capture_image(filename: str, attempt: int = 1) -> None:
 #   horizontal: keep centre 70 %  →  x from 15 % to 85 %
 #   vertical:   keep top    60 %  →  y from  0 % to 60 %
 #
-# Set SYMBOL_CROP_ENABLED = False to disable (useful for debugging).
-SYMBOL_CROP_ENABLED = True
+# Set SYMBOL_CROP_ENABLED = True only after verifying that the symbol tile
+# reliably appears within the defined crop box for YOUR robot's camera angle
+# and viewing distance.  Leaving this False sends the full image to the API
+# (safe default — identical to the original behaviour before this feature
+# was added).
+SYMBOL_CROP_ENABLED = False
 SYMBOL_CROP_X0 = 0.15   # left  boundary (fraction of image width)
 SYMBOL_CROP_X1 = 0.85   # right boundary
 SYMBOL_CROP_Y0 = 0.00   # top   boundary
