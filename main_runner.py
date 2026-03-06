@@ -102,13 +102,23 @@ ROBOT_START_DIR = 0    # Direction.NORTH in algo convention (0=N, 2=E, 4=S, 6=W)
 # How long to wait for a STM32 ACK before moving on (seconds)
 STM_ACK_TIMEOUT = 15.0
 
+# Serial read timeout for individual readline() calls (seconds).
+# Keep this SHORT so the polling loop can re-check the deadline accurately.
+# The outer deadline (STM_ACK_TIMEOUT) controls the total wait time.
+STM_SERIAL_READ_TIMEOUT = 0.1
+
+# If this many consecutive motion commands time out without an ACK the runner
+# will stop sending further commands and raise an error.
+# Set to 0 to disable the guard (not recommended).
+STM_MAX_CONSECUTIVE_TIMEOUTS = 5
+
 # Max capture + recognition attempts per obstacle before giving up
 MAX_SNAP_ATTEMPTS = 6
 
 # When True the script loops indefinitely: after each run finishes (or fails)
 # it resets and waits for the next Android Bluetooth connection automatically.
 # Set to False to exit after a single run.
-AUTO_RESTART = True
+AUTO_RESTART = False
 
 # Seconds to pause between runs before accepting the next connection
 RESTART_DELAY = 3.0
@@ -265,7 +275,10 @@ class STMSerial:
     # ── Connect ───────────────────────────────────────────────────────────────
     def connect(self) -> None:
         log.info(f"Opening serial port {SERIAL_PORT} @ {BAUD_RATE} baud …")
-        self._ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=STM_ACK_TIMEOUT)
+        # Use a SHORT per-read timeout so readline() never blocks for longer
+        # than STM_SERIAL_READ_TIMEOUT; the outer deadline loop in
+        # _send_stm_and_wait_ack() then controls the true total wait.
+        self._ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=STM_SERIAL_READ_TIMEOUT)
         time.sleep(2)                       # allow STM32 to finish reset
         self._ser.reset_input_buffer()
         log.info("✅  STM32 serial connected.")
@@ -817,6 +830,7 @@ class MainRunner:
           Unknown             →  log warning, skip
         """
         total = len(commands)
+        self._stm_timeout_count = 0          # reset consecutive-timeout counter
         log.info(f"Starting execution of {total} command(s) …")
 
         for idx, cmd in enumerate(commands, 1):
@@ -843,7 +857,27 @@ class MainRunner:
                 if stm_cmd:
                     if stm_cmd != cmd:
                         log.info(f"    ↳ converted: {cmd!r}  →  {stm_cmd!r}")
-                    self._send_stm_and_wait_ack(stm_cmd)
+                    acked = self._send_stm_and_wait_ack(stm_cmd)
+                    if not acked:
+                        self._stm_timeout_count += 1
+                        log.warning(
+                            f"  Consecutive STM32 timeouts: "
+                            f"{self._stm_timeout_count}/{STM_MAX_CONSECUTIVE_TIMEOUTS}"
+                        )
+                        if (STM_MAX_CONSECUTIVE_TIMEOUTS > 0
+                                and self._stm_timeout_count
+                                    >= STM_MAX_CONSECUTIVE_TIMEOUTS):
+                            log.error(
+                                f"🛑  STM32 unresponsive: "
+                                f"{self._stm_timeout_count} consecutive timeouts. "
+                                f"Aborting command execution."
+                            )
+                            raise RuntimeError(
+                                f"STM32 stopped responding after "
+                                f"{self._stm_timeout_count} consecutive timeouts."
+                            )
+                    else:
+                        self._stm_timeout_count = 0   # reset on success
                 else:
                     log.warning(f"Conversion returned None for {cmd!r} — skipped.")
 
@@ -894,44 +928,73 @@ class MainRunner:
             "signal":      signal,
         })
 
+        # Send TARGET message: plain-text "TARGET,<obstacle_id>,<image_id>"
+        # obstacle_id = the original obstacle being scanned
+        # img_id      = the recognised class_id (detected value)
+        target_msg = f"TARGET,{obstacle_id},{img_id}"
+        log.info(f"📡  Sending TARGET → {target_msg!r}")
+        self.android.send(target_msg)
+
     # ── Send STM32 command and wait for OK / ACK ──────────────────────────────
-    def _send_stm_and_wait_ack(self, cmd: str) -> None:
+    def _send_stm_and_wait_ack(self, cmd: str) -> bool:
         """
         Send one STM32 text-format command over serial and block until the
-        firmware replies with a line starting with "OK" or "ACK"
-        (both are accepted, matching movement.py behaviour).
+        firmware replies with a line starting with "OK" or "ACK".
 
-        Uses ser.in_waiting polling (non-blocking reads) so the loop doesn't
-        stall the serial port between bytes.  Falls through after
-        STM_ACK_TIMEOUT seconds with a warning.
+        Design notes
+        ────────────
+        • The serial port is opened with a SHORT per-read timeout
+          (STM_SERIAL_READ_TIMEOUT = 0.1 s) so each readline() call returns
+          quickly even when no data arrives.  This prevents readline() from
+          blocking for 15 s when only a partial line is in the RX buffer.
+        • The outer deadline loop (STM_ACK_TIMEOUT) is therefore always
+          honoured accurately.
+        • The RX buffer is flushed BEFORE sending so stale bytes from a
+          previous late ACK cannot be mistaken for the current command's ACK.
+
+        Returns True if an ACK was received, False on timeout.
         """
+        ser = self.stm._ser
+        if ser is None or not ser.is_open:
+            log.error(f"STM32 serial not open — cannot send {cmd!r}")
+            return False
+
+        # Flush stale bytes so we don't read a leftover ACK from a prior cmd
+        ser.reset_input_buffer()
+
         try:
             self.stm.send(cmd)
         except Exception as exc:
             log.error(f"STM32 send failed for {cmd!r}: {exc}")
-            return
+            return False
 
-        ser = self.stm._ser          # direct access for in_waiting check
-        deadline = time.time() + STM_ACK_TIMEOUT
+        deadline    = time.time() + STM_ACK_TIMEOUT
+        line_buf    = b""            # accumulate bytes across short reads
 
         while time.time() < deadline:
-            if ser is None or not ser.is_open:
-                break
-            if ser.in_waiting:
-                raw  = ser.readline()
-                line = raw.strip().decode("utf-8", errors="ignore")
-                log.debug(f"← STM32: {line!r}")
-                if any(line.upper().startswith(pfx) for pfx in STM32_ACK_PREFIXES):
-                    log.info(f"✅  STM32 OK for: {cmd!r}  (reply: {line!r})")
-                    return
-                # Non-OK lines (status messages etc.) are logged but don't stop the wait
-                log.debug(f"STM32 non-OK while waiting for {cmd!r}: {line!r}")
-            else:
-                time.sleep(0.005)   # 5 ms yield to avoid busy-spinning
+            # readline() returns after STM_SERIAL_READ_TIMEOUT seconds if no '\n'
+            chunk = ser.readline()   # non-blocking style (short timeout on port)
+
+            if chunk:
+                line_buf += chunk
+                # Check for complete line(s) in buffer
+                while b"\n" in line_buf:
+                    raw_line, line_buf = line_buf.split(b"\n", 1)
+                    line = raw_line.strip().decode("utf-8", errors="ignore")
+                    if not line:
+                        continue
+                    log.debug(f"← STM32: {line!r}")
+                    if any(line.upper().startswith(pfx) for pfx in STM32_ACK_PREFIXES):
+                        log.info(f"✅  STM32 OK for: {cmd!r}  (reply: {line!r})")
+                        return True
+                    # Non-ACK lines (debug prints, status, etc.) – keep waiting
+                    log.debug(f"STM32 non-ACK while waiting for {cmd!r}: {line!r}")
+            # readline() returned empty (timeout) – check deadline and loop
 
         log.warning(
             f"⚠️  No OK/ACK within {STM_ACK_TIMEOUT:.0f}s for {cmd!r} — continuing."
         )
+        return False
 
     # ── Report final results to Android ───────────────────────────────────────
     def _report_results(self) -> List[dict]:
