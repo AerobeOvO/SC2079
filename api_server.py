@@ -455,10 +455,16 @@ def path_planning():
 @app.route('/image-new', methods=['POST'])
 def predict_image_new():
     """
-    Optimized image detection endpoint.
+    Image detection endpoint (from Algo/Algorithm/main.py).
     Saves the original upload and an annotated result image to disk.
     Expected: multipart/form-data with 'file' field
-    Optional form field: 'confidence' (float, default 0.35)
+    Optional form field: 'confidence' (float, default 0.25)
+    Returns: {
+        "success": bool,
+        "count": int,
+        "detections": [{"class": str, "confidence": float}, ...],
+        "result_image": str   # path to annotated image saved on server
+    }
     """
     if not YOLO_AVAILABLE or MODEL is None:
         return jsonify({"error": "Model not available"}), 500
@@ -474,7 +480,7 @@ def predict_image_new():
     # Read file content once
     file_content = file.read()
 
-    # Save original image to uploads folder
+    # Save original image to uploads folder (relative to server working dir)
     uploads_dir = Path(__file__).parent / 'uploads'
     uploads_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -484,84 +490,40 @@ def predict_image_new():
     with open(upload_path, 'wb') as f:
         f.write(file_content)
 
-    # Get confidence threshold from request, default to 0.35 (optimized default)
-    confidence = float(request.form.get('confidence', 0.35))
+    # Get confidence threshold from request, default to 0.25
+    confidence = float(request.form.get('confidence', 0.25))
 
-    # --- OPTIMIZED PIPELINE START ---
-    
-    # 1. Load and Preprocess
+    # Convert file bytes to PIL Image and run prediction
     image = Image.open(io.BytesIO(file_content))
-    processed_image = preprocess_image(image, enhance_contrast=True)
-
-    # 2. Run Inference
     results = MODEL.predict(
-        source=processed_image,
+        source=image,
         conf=confidence,
-        save=False,
-        iou=0.4,
-        verbose=False,
-        imgsz=1280
+        save=False
     )
 
-    boxes = results[0].boxes
-    detections = []
-    
-    # 3. Filter and Annotate
-    annotated_img = processed_image.copy()
-
-    if len(boxes) > 0:
-        # Apply confusion filtering
-        keep_indices = filter_confusing_detections(boxes, threshold_diff=0.15)
-        filtered_boxes = [boxes[i] for i in keep_indices]
-
-        for box in filtered_boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            cls_idx = int(box.cls.cpu().numpy()[0])
-            conf_val = float(box.conf.cpu().numpy()[0])
-            class_name = CLASS_NAMES[cls_idx]
-
-            # Draw custom bounding box
-            cv2.rectangle(
-                annotated_img,
-                (int(x1), int(y1)), (int(x2), int(y2)),
-                (0, 255, 0), 3,
-            )
-            label = f"{class_name} {conf_val:.2f}"
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(
-                annotated_img,
-                (int(x1), int(y1) - lh - 10),
-                (int(x1) + lw, int(y1)),
-                (0, 255, 0), -1,
-            )
-            cv2.putText(
-                annotated_img, label,
-                (int(x1), int(y1) - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2,
-            )
-            
-            detections.append({
-                "class": class_name,
-                "confidence": conf_val
-            })
-            
-    # --- OPTIMIZED PIPELINE END ---
+    # Get annotated image with bounding boxes drawn
+    annotated_img = results[0].plot()
 
     # Save annotated result image
     results_dir = Path(__file__).parent / 'own_results'
     results_dir.mkdir(exist_ok=True)
     output_path = results_dir / f'result_{timestamp}_{filename_without_ext}.jpg'
-    
-    # OpenCV uses BGR, but our processed_image from PIL might be RGB depending on exact flow. 
-    # Usually cv2.imwrite expects BGR. If colors look weird (blue boxes instead of green), 
-    # swap to cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR) here.
     cv2.imwrite(str(output_path), annotated_img)
 
-    # Build Response
-    if len(detections) > 0:
+    # Build detection list
+    boxes = results[0].boxes
+    detections = []
+    if len(boxes) > 0:
+        for box in boxes:
+            cls_idx = int(box.cls.cpu().numpy()[0])
+            conf = float(box.conf.cpu().numpy()[0])
+            detections.append({
+                "class": CLASS_NAMES[cls_idx],
+                "confidence": conf
+            })
         result = {
             "success": True,
-            "count": len(detections),
+            "count": len(boxes),
             "detections": detections,
             "result_image": str(output_path)
         }
