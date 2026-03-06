@@ -152,6 +152,48 @@ def preprocess_image(image, enhance_contrast=True):
     
     return img_np
 
+def preprocess_image_for_textured_background(image):
+    """
+    Enhanced preprocessing specifically for images with busy/textured backgrounds
+    (e.g. checkered, crumpled paper, fabric patterns).
+    
+    Strategy:
+      1. Convert to LAB color space to separate luminance from color
+      2. Apply CLAHE on the L-channel to boost local contrast of dark letter shapes
+      3. Merge back and convert to BGR for YOLO
+      4. Apply a mild bilateral filter to smooth background noise while
+         preserving hard edges of the letter strokes
+    """
+    if isinstance(image, np.ndarray):
+        img_np = image.copy()
+    else:
+        img_np = np.array(image)
+
+    # Ensure RGB order (PIL gives RGB, cv2 wants BGR for color ops but we
+    # convert explicitly so it is consistent)
+    if img_np.ndim == 2:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+    elif img_np.shape[2] == 4:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+    else:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    # ── 1. CLAHE on LAB luminance channel ─────────────────────────────────
+    lab = cv2.cvtColor(img_np, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    # clipLimit=2.0, tileGridSize=(8,8) works well for letter-on-texture images
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_channel = clahe.apply(l_channel)
+    lab = cv2.merge([l_channel, a_channel, b_channel])
+    img_np = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # ── 2. Bilateral filter to smooth texture noise ────────────────────────
+    img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
+
+    # Convert back to RGB for consistency with the rest of the pipeline
+    img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+    return img_np
+
 def filter_confusing_detections(boxes, threshold_diff=0.15):
     """Filter out potentially confusing detections"""
     if len(boxes) == 0:
@@ -187,71 +229,108 @@ def filter_confusing_detections(boxes, threshold_diff=0.15):
     
     return keep_indices
 
+def _run_yolo(processed_image, confidence, augment=False):
+    """Internal helper: run MODEL.predict and return filtered boxes."""
+    results = MODEL.predict(
+        source=processed_image,
+        conf=confidence,
+        save=False,
+        iou=0.4,
+        verbose=False,
+        imgsz=1280,
+        augment=augment,
+    )
+    boxes = results[0].boxes
+    return boxes
+
+def _boxes_to_segments(boxes):
+    """Convert a list/tensor of boxes to the segments list format."""
+    segments = []
+    for box in boxes:
+        cls_idx = int(box.cls.cpu().numpy()[0])
+        conf = float(box.conf.cpu().numpy()[0])
+        class_name = CLASS_NAMES[cls_idx]
+
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        bbox = {
+            'x1': int(x1),
+            'y1': int(y1),
+            'x2': int(x2),
+            'y2': int(y2)
+        }
+
+        class_id = CLASS_NAME_TO_ID.get(class_name, 'NA')
+
+        segments.append({
+            'class_id': class_id,
+            'class_name': class_name,
+            'confidence': conf,
+            'is_ambiguous': cls_idx in CONFUSING_CLASSES and conf < 0.7,
+            'bbox': bbox
+        })
+    return segments
+
 def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_filtering=True):
     """
-    Run YOLO prediction on image
-    Returns: detection results in format expected by Raspberry Pi
+    Run YOLO prediction on image with automatic fallback for hard cases.
+
+    Pass 1 – standard preprocessing at the given confidence threshold.
+    Pass 2 – if nothing found, retry with CLAHE/bilateral preprocessing
+             designed for busy/textured backgrounds (e.g. checkered, crumpled
+             paper) at a lower confidence (0.20) with YOLO TTA augmentation.
+
+    Returns: (segments, error_str)
     """
     if MODEL is None:
         return None, "Model not loaded"
-    
+
     try:
-        # Load image
         image = Image.open(image_path)
-        
-        # Preprocess if enabled
+        image = resize_image(image, max_dimension=1280)
+
+        # ── Pass 1: standard preprocessing ───────────────────────────────
         if use_preprocessing:
             processed_image = preprocess_image(image, enhance_contrast=True)
         else:
             processed_image = np.array(image)
-        
-        # Run prediction
-        results = MODEL.predict(
-            source=processed_image,
-            conf=confidence,
-            save=False,
-            iou=0.4,
-            verbose=False,
-            imgsz=1280
-        )
-        
-        # Get detection boxes
-        boxes = results[0].boxes
-        
-        # Filter confusing detections if enabled
+
+        boxes = _run_yolo(processed_image, confidence, augment=False)
+
         if use_filtering and len(boxes) > 0:
             keep_indices = filter_confusing_detections(boxes, threshold_diff=0.15)
             boxes = [boxes[i] for i in keep_indices]
-        
-        # Process detections
-        segments = []
-        for box in boxes:
-            cls_idx = int(box.cls.cpu().numpy()[0])
-            conf = float(box.conf.cpu().numpy()[0])
-            class_name = CLASS_NAMES[cls_idx]
-            
-            # Get bounding box coordinates
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            bbox = {
-                'x1': int(x1),
-                'y1': int(y1),
-                'x2': int(x2),
-                'y2': int(y2)
-            }
-            
-            # Get class_id for Raspberry Pi
-            class_id = CLASS_NAME_TO_ID.get(class_name, 'NA')
-            
-            segments.append({
-                'class_id': class_id,
-                'class_name': class_name,
-                'confidence': conf,
-                'is_ambiguous': cls_idx in CONFUSING_CLASSES and conf < 0.7,
-                'bbox': bbox
-            })
-        
+
+        segments = _boxes_to_segments(boxes)
+
+        # ── Pass 2: fallback for textured/busy backgrounds ────────────────
+        # If the first pass found nothing, retry with CLAHE-enhanced
+        # preprocessing and a lower confidence threshold + YOLO augmentation.
+        if len(segments) == 0:
+            print("⚠️  No detection on pass 1 – retrying with texture-aware "
+                  "preprocessing and lower confidence (0.20) ...")
+
+            fallback_conf = min(confidence, 0.20)
+            processed_image_2 = preprocess_image_for_textured_background(
+                np.array(image)
+            )
+
+            boxes2 = _run_yolo(processed_image_2, fallback_conf, augment=True)
+
+            if use_filtering and len(boxes2) > 0:
+                keep_indices2 = filter_confusing_detections(
+                    boxes2, threshold_diff=0.15
+                )
+                boxes2 = [boxes2[i] for i in keep_indices2]
+
+            segments = _boxes_to_segments(boxes2)
+
+            if segments:
+                print(f"✅ Fallback pass 2 found {len(segments)} detection(s).")
+            else:
+                print("❌ Fallback pass 2 also found nothing.")
+
         return segments, None
-        
+
     except Exception as e:
         return None, str(e)
 
