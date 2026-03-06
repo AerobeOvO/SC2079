@@ -396,9 +396,22 @@ def capture_image(filename: str, attempt: int = 1) -> None:
             "Run this script on a Raspberry Pi with picamera enabled."
         )
 
+    # Exposure bracketing
+    # ─────────────────────────────────────────────────────────────────────────
+    # Obstacles are typically mounted on a large DARK board.  Auto-exposure
+    # will aggressively boost the overall brightness, which can overexpose the
+    # symbol tile and blur fine strokes (e.g. the bottom hook of 'G').
+    # Starting at EV=0 (neutral) keeps the symbol tile well-exposed on the
+    # first attempt instead of already over-brightening.
+    #   attempt 1 → EV  0  (neutral, let auto-gain settle)
+    #   attempt 2 → EV +2  (slightly brighter)
+    #   attempt 3 → EV +4  (brighter still)
+    #   attempt 4 → EV -2  (darker, in case symbol is blown out)
+    #   attempt 5 → EV -4
+    #   attempt 6 → EV -6
     if attempt <= 3:
         shutter_us = min(1_000_000, 10_000 * (2 ** (attempt - 1)))
-        ev_comp    = min(6, 2 * attempt)
+        ev_comp    = min(4, 2 * (attempt - 1))   # 0, +2, +4  (was 2, 4, 6)
         iso_value  = 200
     else:
         factor     = max(1, 2 ** (attempt - 3))
@@ -425,19 +438,84 @@ def capture_image(filename: str, attempt: int = 1) -> None:
 # IMAGE RECOGNITION  (via API server /image endpoint)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Symbol-region crop ────────────────────────────────────────────────────────
+# When the robot faces a tall black obstacle board the symbol tile occupies
+# only the upper-centre portion of the frame.  Cropping to that region before
+# sending to YOLO removes the large dark board area that throws off both
+# auto-exposure and the classifier (dark context makes G look like T, etc.).
+#
+# Crop box as fractions of (width, height):
+#   horizontal: keep centre 70 %  →  x from 15 % to 85 %
+#   vertical:   keep top    60 %  →  y from  0 % to 60 %
+#
+# Set SYMBOL_CROP_ENABLED = False to disable (useful for debugging).
+SYMBOL_CROP_ENABLED = True
+SYMBOL_CROP_X0 = 0.15   # left  boundary (fraction of image width)
+SYMBOL_CROP_X1 = 0.85   # right boundary
+SYMBOL_CROP_Y0 = 0.00   # top   boundary
+SYMBOL_CROP_Y1 = 0.60   # bottom boundary
+
+
+def _crop_image_for_symbol(src_path: str) -> bytes:
+    """
+    Return JPEG bytes of the symbol-region crop of the image at *src_path*.
+    Falls back to the raw file bytes if Pillow is not available.
+    """
+    try:
+        from PIL import Image as _Image   # type: ignore
+        import io as _io
+
+        with _Image.open(src_path) as img:
+            w, h = img.size
+            box = (
+                int(w * SYMBOL_CROP_X0),
+                int(h * SYMBOL_CROP_Y0),
+                int(w * SYMBOL_CROP_X1),
+                int(h * SYMBOL_CROP_Y1),
+            )
+            cropped = img.crop(box)
+            buf = _io.BytesIO()
+            cropped.save(buf, format="JPEG", quality=90)
+            log.debug(
+                f"Symbol crop applied: {w}×{h} → "
+                f"{box[2]-box[0]}×{box[3]-box[1]}  box={box}"
+            )
+            return buf.getvalue()
+
+    except ImportError:
+        log.debug("Pillow not available — sending full image (no crop).")
+    except Exception as exc:
+        log.warning(f"Crop failed ({exc}) — sending full image.")
+
+    with open(src_path, "rb") as f:
+        return f.read()
+
+
 def send_image_to_api(filename: str) -> str:
     """
     POST a JPEG file to the /image endpoint and return the top class_id string.
+
+    When SYMBOL_CROP_ENABLED is True the image is cropped to the centre-upper
+    region (where the symbol tile is) before posting.  This removes the large
+    dark obstacle board from the frame, improving YOLO accuracy for symbols
+    whose fine strokes (e.g. the bottom hook of 'G') can be washed out by
+    auto-exposure bias caused by the dark background.
+
     Returns "NA" on API error or no detection.
     """
     url = f"http://{API_IP}:{API_PORT}/image"
     try:
-        with open(filename, "rb") as f:
-            resp = requests.post(
-                url,
-                files={"file": (os.path.basename(filename), f)},
-                timeout=30,
-            )
+        if SYMBOL_CROP_ENABLED:
+            img_bytes = _crop_image_for_symbol(filename)
+        else:
+            with open(filename, "rb") as f:
+                img_bytes = f.read()
+
+        resp = requests.post(
+            url,
+            files={"file": (os.path.basename(filename), img_bytes, "image/jpeg")},
+            timeout=30,
+        )
         if resp.status_code == 200:
             data     = resp.json()
             segments = data.get("segments", [])
@@ -857,6 +935,7 @@ class MainRunner:
                 if stm_cmd:
                     if stm_cmd != cmd:
                         log.info(f"    ↳ converted: {cmd!r}  →  {stm_cmd!r}")
+                    time.sleep(0.5)   # 0.5 s settling lag before each motion command
                     acked = self._send_stm_and_wait_ack(stm_cmd)
                     if not acked:
                         self._stm_timeout_count += 1
