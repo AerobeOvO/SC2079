@@ -81,15 +81,34 @@ CLASS_NAME_TO_ID = {
     'circle': '40'   # Stop (or could be a different symbol)
 }
 
-# Define potentially confusing class pairs
+# CLASS_NAMES (for reference when editing this dict):
+# [0]A [1]B [2]Bullseye [3]C [4]D [5]E [6]F [7]G [8]H [9]S [10]T
+# [11]U [12]V [13]W [14]X [15]Y [16]Z [17]circle [18]down [19]eight
+# [20]five [21]four [22]left [23]nine [24]one [25]right [26]seven
+# [27]six [28]three [29]two [30]up
+
+# Define potentially confusing class pairs (symmetric).
+# Values are lists of class indices that this index can be confused WITH.
 CONFUSING_CLASSES = {
-    2: [29],   # Bullseye vs up arrow
-    29: [2],   # up arrow vs Bullseye
-    17: [2],   # circle vs Bullseye
-    18: [29],  # down vs up
-    22: [24],  # left vs right
-    24: [22],  # right vs left
+    2:  [30],       # Bullseye  ↔ Up Arrow   (both have circular/round shapes)
+    30: [2, 18],    # Up Arrow  ↔ Bullseye AND Up ↔ Down  (NOTE: no dup keys)
+    17: [2],        # circle    ↔ Bullseye   (both round)
+    18: [30],       # Down      ↔ Up         (mirror images of each other)
+    22: [25],       # Left      ↔ Right      (mirror images)
+    25: [22],       # Right     ↔ Left
+    6:  [8],        # F         ↔ H          (shadow/texture adds phantom right stroke to F)
+    8:  [6],        # H         ↔ F
+    7:  [10],       # G         ↔ T          (G's curved top arc misread as T crossbar
+    10: [7],        #                          on dark/colored/wood-texture backgrounds)
+    9:  [28],       # S         ↔ Three      (curved shapes look similar at distance)
+    28: [9],        # Three     ↔ S
 }
+
+# Classes that trigger the background-suppression disambiguation pass when
+# detected with confidence below this threshold.
+_AMBIGUITY_CONF_THRESHOLD = 0.65
+_AMBIGUOUS_CLASSES = {'H', 'G', 'T', 'F', 'S', 'three'}
+
 
 def load_model():
     """Load YOLO model at startup"""
@@ -156,21 +175,20 @@ def preprocess_image_for_textured_background(image):
     """
     Enhanced preprocessing specifically for images with busy/textured backgrounds
     (e.g. checkered, crumpled paper, fabric patterns).
-    
+
     Strategy:
-      1. Convert to LAB color space to separate luminance from color
-      2. Apply CLAHE on the L-channel to boost local contrast of dark letter shapes
-      3. Merge back and convert to BGR for YOLO
+      1. Convert to LAB color space to separate luminance from color.
+      2. Apply CLAHE on the L-channel to boost local contrast of dark letter
+         shapes against the repetitive background pattern.
+      3. Merge back and convert to RGB.
       4. Apply a mild bilateral filter to smooth background noise while
-         preserving hard edges of the letter strokes
+         preserving the hard edges of the letter strokes.
     """
     if isinstance(image, np.ndarray):
         img_np = image.copy()
     else:
         img_np = np.array(image)
 
-    # Ensure RGB order (PIL gives RGB, cv2 wants BGR for color ops but we
-    # convert explicitly so it is consistent)
     if img_np.ndim == 2:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
     elif img_np.shape[2] == 4:
@@ -178,21 +196,149 @@ def preprocess_image_for_textured_background(image):
     else:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # ── 1. CLAHE on LAB luminance channel ─────────────────────────────────
+    # 1. CLAHE on LAB luminance channel
     lab = cv2.cvtColor(img_np, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
-    # clipLimit=2.0, tileGridSize=(8,8) works well for letter-on-texture images
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_channel = clahe.apply(l_channel)
     lab = cv2.merge([l_channel, a_channel, b_channel])
     img_np = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # ── 2. Bilateral filter to smooth texture noise ────────────────────────
+    # 2. Bilateral filter to smooth texture noise
     img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
 
-    # Convert back to RGB for consistency with the rest of the pipeline
     img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
     return img_np
+
+def preprocess_suppress_background(image):
+    """
+    Background-suppression preprocessing: replaces the textured background
+    with pure white while keeping the dark letter strokes intact.
+
+    This is specifically useful when textured backgrounds (crumpled paper,
+    fabric shadows) create phantom dark strokes that cause F to be misread
+    as H (shadow on the right of F looks like H's second vertical bar).
+
+    NOTE: This function assumes dark letters on a relatively light/textured
+    background.  For colored or dark backgrounds use preprocess_color_adaptive()
+    instead.
+
+    Algorithm:
+      1. Convert to grayscale and apply Gaussian blur to suppress fine texture.
+      2. Adaptive thresholding creates a binary mask: dark letter pixels → 0,
+         light background pixels → 255.
+      3. Morphological opening removes isolated noise dots (tiny shadows that
+         aren't part of the actual letter).
+      4. Wherever the mask says "background", paint that pixel white in the
+         original colour image.
+
+    Result: the YOLO model sees a clean black letter on a white background,
+    with no texture artefacts to confuse visually similar shapes.
+    """
+    if isinstance(image, np.ndarray):
+        img_np = image.copy()
+    else:
+        img_np = np.array(image)
+
+    if img_np.ndim == 2:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+    elif img_np.shape[2] == 4:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Blur first so fine paper/fabric texture doesn't fool the threshold
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Adaptive threshold: background pixels → 255, dark letter pixels → 0
+    binary = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=31,   # large block to handle uneven illumination across card
+        C=10
+    )
+
+    # Remove isolated noise dots (e.g. tiny shadows in crumpled paper)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Where binary == 255 (background), paint white in the colour image
+    result = img_bgr.copy()
+    result[binary == 255] = [255, 255, 255]
+
+    result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+    return result
+
+
+def preprocess_color_adaptive(image):
+    """
+    Color-agnostic background normalisation that works with ANY card background
+    color: white, wood-texture, brown, blue, red, dark, or any other color.
+
+    Unlike preprocess_suppress_background() which assumes DARK letters on a
+    LIGHT background, this function automatically detects which pixels are
+    letter strokes vs background by comparing lightness across the image using
+    Otsu's optimal threshold on the LAB L (lightness) channel.
+
+    Algorithm
+    ─────────
+    1. Convert to LAB color space – the L channel captures lightness
+       independent of hue/saturation, so a blue background and a red
+       background with the same perceived brightness are treated identically.
+    2. Gaussian blur on L-channel to suppress fine texture grain.
+    3. Otsu's global threshold finds the optimal dark/light split without
+       any hard-coded threshold value.
+    4. Orientation detection: if fewer than 45 % of pixels are white after
+       thresholding, the card has a DARK background with LIGHT letters →
+       invert the binary mask so background always = white in the output.
+    5. Morphological open (noise removal) + close (fill stroke holes).
+    6. Compose result: background pixels → white, letter pixels → original
+       colour (so the model still benefits from colour cues).
+
+    Returns an RGB numpy array (black/dark letter strokes on white background).
+    """
+    if isinstance(image, np.ndarray):
+        img_np = image.copy()
+    else:
+        img_np = np.array(image)
+
+    if img_np.ndim == 2:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+    elif img_np.shape[2] == 4:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    # 1. LAB L-channel (lightness, hue-independent)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l_channel = lab[:, :, 0]
+
+    # 2. Blur to suppress fine texture / grain
+    blurred = cv2.GaussianBlur(l_channel, (7, 7), 0)
+
+    # 3. Otsu's global threshold
+    _, binary = cv2.threshold(blurred, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 4. Auto-detect orientation (dark-on-light vs light-on-dark)
+    white_fraction = np.sum(binary == 255) / binary.size
+    if white_fraction < 0.45:
+        # Most pixels are dark → light letters on dark background → invert
+        binary = cv2.bitwise_not(binary)
+
+    # 5. Morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # 6. Compose: background (binary==255) → white; letter pixels → original
+    result = img_bgr.copy()
+    result[binary == 255] = [255, 255, 255]
+
+    return cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
 
 def filter_confusing_detections(boxes, threshold_diff=0.15):
     """Filter out potentially confusing detections"""
@@ -230,7 +376,7 @@ def filter_confusing_detections(boxes, threshold_diff=0.15):
     return keep_indices
 
 def _run_yolo(processed_image, confidence, augment=False):
-    """Internal helper: run MODEL.predict and return filtered boxes."""
+    """Internal helper: run MODEL.predict and return raw boxes."""
     results = MODEL.predict(
         source=processed_image,
         conf=confidence,
@@ -240,8 +386,7 @@ def _run_yolo(processed_image, confidence, augment=False):
         imgsz=1280,
         augment=augment,
     )
-    boxes = results[0].boxes
-    return boxes
+    return results[0].boxes
 
 def _boxes_to_segments(boxes):
     """Convert a list/tensor of boxes to the segments list format."""
@@ -276,8 +421,17 @@ def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_
 
     Pass 1 – standard preprocessing at the given confidence threshold.
     Pass 2 – if nothing found, retry with CLAHE/bilateral preprocessing
-             designed for busy/textured backgrounds (e.g. checkered, crumpled
-             paper) at a lower confidence (0.20) with YOLO TTA augmentation.
+             designed for busy/textured backgrounds (checkered, crumpled
+             paper, wood) at confidence 0.20 with YOLO TTA augmentation.
+    Pass 3 – if Pass 1+2 both found nothing, retry with color-adaptive
+             Otsu normalisation (preprocess_color_adaptive).  This handles
+             ANY background color (white, colored, dark, wood-texture) by
+             auto-detecting letter vs background without assuming which is
+             darker, and normalising to black-on-white.
+    Pass 4 – if any earlier pass returned an ambiguous class (G, T, H, F, S …)
+             with confidence below _AMBIGUITY_CONF_THRESHOLD (0.65), retry with
+             background-suppression (adaptive threshold) to strip texture artefacts.
+             Takes the higher-confidence result from Pass 3 vs Pass 4.
 
     Returns: (segments, error_str)
     """
@@ -287,47 +441,87 @@ def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_
     try:
         image = Image.open(image_path)
         image = resize_image(image, max_dimension=1280)
+        img_array = np.array(image)   # keep a clean copy for fallback passes
+
+        fallback_conf = min(confidence, 0.20)
+
+        def _filter(boxes):
+            if use_filtering and len(boxes) > 0:
+                keep = filter_confusing_detections(boxes, threshold_diff=0.15)
+                return [boxes[i] for i in keep]
+            return list(boxes)
 
         # ── Pass 1: standard preprocessing ───────────────────────────────
         if use_preprocessing:
             processed_image = preprocess_image(image, enhance_contrast=True)
         else:
-            processed_image = np.array(image)
+            processed_image = img_array
 
-        boxes = _run_yolo(processed_image, confidence, augment=False)
+        boxes1 = _run_yolo(processed_image, confidence, augment=False)
+        segments = _boxes_to_segments(_filter(boxes1))
 
-        if use_filtering and len(boxes) > 0:
-            keep_indices = filter_confusing_detections(boxes, threshold_diff=0.15)
-            boxes = [boxes[i] for i in keep_indices]
-
-        segments = _boxes_to_segments(boxes)
-
-        # ── Pass 2: fallback for textured/busy backgrounds ────────────────
-        # If the first pass found nothing, retry with CLAHE-enhanced
-        # preprocessing and a lower confidence threshold + YOLO augmentation.
+        # ── Pass 2: CLAHE for textured / busy backgrounds ─────────────────
         if len(segments) == 0:
-            print("⚠️  No detection on pass 1 – retrying with texture-aware "
-                  "preprocessing and lower confidence (0.20) ...")
-
-            fallback_conf = min(confidence, 0.20)
-            processed_image_2 = preprocess_image_for_textured_background(
-                np.array(image)
-            )
-
-            boxes2 = _run_yolo(processed_image_2, fallback_conf, augment=True)
-
-            if use_filtering and len(boxes2) > 0:
-                keep_indices2 = filter_confusing_detections(
-                    boxes2, threshold_diff=0.15
-                )
-                boxes2 = [boxes2[i] for i in keep_indices2]
-
-            segments = _boxes_to_segments(boxes2)
-
+            print("⚠️  Pass 1: no detection – retrying with texture-aware "
+                  "preprocessing (CLAHE, conf=0.20, TTA) …")
+            img2 = preprocess_image_for_textured_background(img_array)
+            boxes2 = _run_yolo(img2, fallback_conf, augment=True)
+            segments = _boxes_to_segments(_filter(boxes2))
             if segments:
-                print(f"✅ Fallback pass 2 found {len(segments)} detection(s).")
+                print(f"✅ Pass 2 found {len(segments)} detection(s).")
             else:
-                print("❌ Fallback pass 2 also found nothing.")
+                print("❌ Pass 2 also found nothing.")
+
+        # ── Pass 3: color-adaptive Otsu normalization ─────────────────────
+        # Triggered when both Pass 1 & 2 found nothing.
+        # Handles ANY background color (dark, colored, wood, inverted) by
+        # auto-detecting letter/background orientation before normalising.
+        if len(segments) == 0:
+            print("⚠️  Pass 3: retrying with color-adaptive Otsu normalization …")
+            img3 = preprocess_color_adaptive(img_array)
+            boxes3 = _run_yolo(img3, fallback_conf, augment=True)
+            segments = _boxes_to_segments(_filter(boxes3))
+            if segments:
+                print(f"✅ Pass 3 (color-adaptive) found {len(segments)} detection(s).")
+            else:
+                print("❌ Pass 3 also found nothing.")
+
+        # ── Pass 4: background-suppression for ambiguous classes ──────────
+        # Triggered when any earlier pass returned a class that is known to
+        # be ambiguous on non-white backgrounds (G↔T, F↔H, S↔Three …)
+        # AND the confidence is below the ambiguity threshold.
+        # Compares Pass-4 result against current best and keeps the winner.
+        top_ambiguous = (
+            len(segments) > 0
+            and segments[0]['class_name'] in _AMBIGUOUS_CLASSES
+            and segments[0]['confidence'] < _AMBIGUITY_CONF_THRESHOLD
+        )
+
+        if top_ambiguous:
+            prev_name = segments[0]['class_name']
+            prev_conf = segments[0]['confidence']
+            print(f"⚠️  Pass 4: '{prev_name}' detected at low confidence "
+                  f"{prev_conf:.2f} < {_AMBIGUITY_CONF_THRESHOLD} – "
+                  "retrying with background-suppression to disambiguate …")
+
+            img4 = preprocess_suppress_background(img_array)
+            boxes4 = _run_yolo(img4, fallback_conf, augment=True)
+            segments4 = _boxes_to_segments(_filter(boxes4))
+
+            if segments4:
+                new_conf = segments4[0]['confidence']
+                new_name = segments4[0]['class_name']
+                if new_conf > prev_conf:
+                    print(f"✅ Pass 4 resolved to '{new_name}' "
+                          f"(conf={new_conf:.2f} > {prev_conf:.2f}) "
+                          f"from '{prev_name}'.")
+                    segments = segments4
+                else:
+                    print(f"ℹ️  Pass 4 result '{new_name}' "
+                          f"(conf={new_conf:.2f}) not better than "
+                          f"'{prev_name}' ({prev_conf:.2f}); keeping original.")
+            else:
+                print(f"ℹ️  Pass 4 found nothing; keeping '{prev_name}' result.")
 
         return segments, None
 
