@@ -461,11 +461,14 @@ def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_
         segments = _boxes_to_segments(_filter(boxes1))
 
         # ── Pass 2: CLAHE for textured / busy backgrounds ─────────────────
+        # augment=False: the preprocessing itself provides the quality uplift;
+        # TTA augmentation (augment=True) adds 3-5× latency per pass which
+        # can push total inference time past the 45 s API timeout.
         if len(segments) == 0:
             print("⚠️  Pass 1: no detection – retrying with texture-aware "
-                  "preprocessing (CLAHE, conf=0.20, TTA) …")
+                  "preprocessing (CLAHE, conf=0.20) …")
             img2 = preprocess_image_for_textured_background(img_array)
-            boxes2 = _run_yolo(img2, fallback_conf, augment=True)
+            boxes2 = _run_yolo(img2, fallback_conf, augment=False)
             segments = _boxes_to_segments(_filter(boxes2))
             if segments:
                 print(f"✅ Pass 2 found {len(segments)} detection(s).")
@@ -479,7 +482,7 @@ def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_
         if len(segments) == 0:
             print("⚠️  Pass 3: retrying with color-adaptive Otsu normalization …")
             img3 = preprocess_color_adaptive(img_array)
-            boxes3 = _run_yolo(img3, fallback_conf, augment=True)
+            boxes3 = _run_yolo(img3, fallback_conf, augment=False)
             segments = _boxes_to_segments(_filter(boxes3))
             if segments:
                 print(f"✅ Pass 3 (color-adaptive) found {len(segments)} detection(s).")
@@ -505,7 +508,7 @@ def predict_with_model(image_path, confidence=0.35, use_preprocessing=True, use_
                   "retrying with background-suppression to disambiguate …")
 
             img4 = preprocess_suppress_background(img_array)
-            boxes4 = _run_yolo(img4, fallback_conf, augment=True)
+            boxes4 = _run_yolo(img4, fallback_conf, augment=False)
             segments4 = _boxes_to_segments(_filter(boxes4))
 
             if segments4:

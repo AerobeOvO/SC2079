@@ -113,7 +113,7 @@ STM_SERIAL_READ_TIMEOUT = 0.1
 STM_MAX_CONSECUTIVE_TIMEOUTS = 5
 
 # Max capture + recognition attempts per obstacle before giving up
-MAX_SNAP_ATTEMPTS = 6
+MAX_SNAP_ATTEMPTS = 3
 
 # When True the script loops indefinitely: after each run finishes (or fails)
 # it resets and waits for the next Android Bluetooth connection automatically.
@@ -518,7 +518,7 @@ def send_image_to_api(filename: str) -> str:
         resp = requests.post(
             url,
             files={"file": (os.path.basename(filename), img_bytes, "image/jpeg")},
-            timeout=30,
+            timeout=45,   # 4-pass pipeline (no TTA) typically <15 s; 45 s gives headroom
         )
         if resp.status_code == 200:
             data     = resp.json()
@@ -540,7 +540,7 @@ def send_image_to_api(filename: str) -> str:
             return "NA"
 
     except requests.exceptions.Timeout:
-        log.error("Image API timed out (>30 s).")
+        log.error("Image API timed out (>45 s).")
         return "NA"
     except Exception as exc:
         log.error(f"Image API error: {exc}", exc_info=True)
