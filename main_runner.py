@@ -521,7 +521,7 @@ class MainRunner:
                 log.warning(f"stitch-reset failed (non-critical): {exc}")
 
             self._execute_commands(commands)
-            self._report_results()
+            self._report_results(total_obstacles=len(obstacles))
 
             return True   
 
@@ -709,7 +709,7 @@ class MainRunner:
                     
         return False
 
-    def _report_results(self) -> List[dict]:
+    def _report_results(self, total_obstacles: int = 0) -> List[dict]:
         div = "═" * 52
 
         print(f"\n{div}")
@@ -747,14 +747,14 @@ class MainRunner:
               .replace("\n", "\n  "))
         print()
 
-        # --- Trigger PC Display ---
+        # --- Trigger PC tiled display (Point 7) ---
         try:
-            stitch_url = f"http://{API_IP}:{API_PORT}/stitch"
-            log.info(f"Triggering PC stitched image display at {stitch_url} …")
+            stitch_url = f"http://{API_IP}:{API_PORT}/stitch?total={total_obstacles}"
+            log.info(f"Triggering PC tiled display: {stitch_url} …")
             requests.get(stitch_url, timeout=5)
         except Exception as exc:
             log.warning(f"⚠️  Could not trigger PC stitch display: {exc}")
-        # --------------------------
+        # -------------------------------------------
 
         return summary
 
