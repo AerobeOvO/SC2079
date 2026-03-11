@@ -207,88 +207,157 @@ def predict_with_model(image_path, confidence: float = 0.35, signal: str = "C"):
 # STITCH / TILED DISPLAY  (Point 7)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _add_label_overlay(bgr_img: np.ndarray,
+                        display_name: str, class_id: str) -> np.ndarray:
+    """
+    Draw a white info box in the bottom-right corner of the annotated image,
+    matching the Point-7 screenshot format:
+        Right arrow
+        Image id=38
+    """
+    img = bgr_img.copy()
+    h, w = img.shape[:2]
+
+    line1 = display_name
+    line2 = f"Image id={class_id}"
+
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    scale      = max(0.45, min(0.7, w / 900))
+    thickness  = 1
+    pad        = 8
+
+    (tw1, th1), bl1 = cv2.getTextSize(line1, font, scale, thickness)
+    (tw2, th2), bl2 = cv2.getTextSize(line2, font, scale, thickness)
+
+    box_w = max(tw1, tw2) + pad * 2
+    box_h = th1 + th2 + pad * 3
+
+    # Anchor bottom-right, inset by 10 px from edges
+    x2 = w - 10
+    y2 = h - 10
+    x1 = x2 - box_w
+    y1 = y2 - box_h
+
+    # White fill + light-grey border
+    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), cv2.FILLED)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (180, 180, 180), 1)
+
+    # Black text
+    cv2.putText(img, line1, (x1 + pad, y1 + pad + th1),
+                font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+    cv2.putText(img, line2, (x1 + pad, y1 + pad * 2 + th1 + th2),
+                font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+    return img
+
+
 def _save_snap_result(obstacle_id: str, detected_id: str, annotated_bgr: np.ndarray):
     """
-    Save the annotated image for one obstacle into RESULTS_DIR.
-    Filename: <obstacle_id>_<display_name>_id<detected_id>.jpg
-    e.g.  "2_H_id27.jpg"
+    Save the annotated + labelled image for one obstacle into RESULTS_DIR.
+    - Files are named  {obstacle_id:02d}_{display}_id{class_id}.jpg
+    - Any previous file for the SAME obstacle_id is deleted first.
+    - A 'NA' result never overwrites a valid previous detection.
     """
     RESULTS_DIR.mkdir(exist_ok=True)
+
+    ob_prefix = f"{int(obstacle_id):02d}_"
+    existing  = list(RESULTS_DIR.glob(f"{ob_prefix}*"))
+
+    # Don't overwrite a real detection with NA
+    if detected_id == "NA" and existing:
+        print(f"ℹ️   Snap {obstacle_id}: keeping previous result (new = NA).")
+        return
+
+    # Remove old file(s) for this obstacle
+    for old in existing:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
     display = DISPLAY_NAMES.get(detected_id, detected_id)
-    fname   = f"{int(obstacle_id):02d}_{display}_id{detected_id}.jpg"
-    cv2.imwrite(str(RESULTS_DIR / fname), annotated_bgr)
+    fname   = f"{ob_prefix}{display}_id{detected_id}.jpg"
+
+    # Add the human-readable white info box on top of YOLO's annotation
+    labelled = _add_label_overlay(annotated_bgr, display, detected_id)
+    cv2.imwrite(str(RESULTS_DIR / fname), labelled)
     print(f"💾  Saved snap result: {fname}")
 
 
-def _build_tiled_image(results_dir: Path) -> Path | None:
+def _build_tiled_image(results_dir: Path,
+                        total_obstacles: int = 0) -> Path | None:
     """
-    Load all annotated images from results_dir, arrange them in a 3-column
-    grid (like the example in Point 7), and save as 'tiled_result.jpg'.
-    Returns the path to the saved file, or None if no images found.
+    Build a tiled grid exactly like the Point-7 screenshot:
+      • 3 columns, N rows
+      • Occupied slots: actual YOLO-annotated image (with white label box)
+      • Empty slots:    dark-red rectangle with centred "Image N" text
+      • Light-blue (#87CEEB) background / separator colour
+    total_obstacles fixes the grid size so empty slots are numbered correctly.
     """
-    image_files = sorted(results_dir.glob("*.jpg"),
-                         key=lambda p: p.name if 'tiled' not in p.name else 'zzz')
-    image_files = [p for p in image_files if 'tiled' not in p.name]
+    # --- collect saved images keyed by obstacle_id ---
+    snap_files: dict[int, Path] = {}
+    for p in results_dir.glob("*.jpg"):
+        if 'tiled' in p.name:
+            continue
+        stem_parts = p.stem.split('_')
+        if stem_parts[0].isdigit():
+            snap_files[int(stem_parts[0])] = p
 
-    if not image_files:
+    n = max(total_obstacles, max(snap_files.keys(), default=0))
+    if n == 0:
         return None
 
     THUMB_W, THUMB_H = 480, 360
-    LABEL_H          = 44
-    PADDING          = 12
-    COLS             = min(3, len(image_files))
-    ROWS             = math.ceil(len(image_files) / COLS)
+    SEP              = 6      # gap between tiles
+    BORDER           = 16     # outer blue border
+    COLS             = min(3, n)
+    ROWS             = math.ceil(n / COLS)
 
-    grid_w = COLS * THUMB_W + (COLS + 1) * PADDING
-    grid_h = ROWS * (THUMB_H + LABEL_H) + (ROWS + 1) * PADDING
+    grid_w = BORDER * 2 + COLS * THUMB_W + (COLS - 1) * SEP
+    grid_h = BORDER * 2 + ROWS * THUMB_H + (ROWS - 1) * SEP
 
-    grid = Image.new('RGB', (grid_w, grid_h), color=(20, 20, 20))
+    # Light-blue background (matches screenshot)
+    grid = Image.new('RGB', (grid_w, grid_h), color=(135, 185, 220))
     draw = ImageDraw.Draw(grid)
 
-    # Try to load a font; fall back to default if not available
     try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
+        font_lbl = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 26)
     except Exception:
-        font = ImageFont.load_default()
+        font_lbl = ImageFont.load_default()
 
-    for idx, img_path in enumerate(image_files):
-        img_bgr = cv2.imread(str(img_path))
-        if img_bgr is None:
-            continue
+    for idx in range(n):
+        obstacle_id = idx + 1
+        row, col    = divmod(idx, COLS)
+        x = BORDER + col * (THUMB_W + SEP)
+        y = BORDER + row * (THUMB_H + SEP)
 
-        # Resize thumbnail
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb).resize(
-            (THUMB_W, THUMB_H), Image.Resampling.LANCZOS
-        )
-
-        row, col = divmod(idx, COLS)
-        x = PADDING + col * (THUMB_W + PADDING)
-        y = PADDING + row * (THUMB_H + LABEL_H + PADDING)
-
-        grid.paste(pil_img, (x, y))
-
-        # Label below thumbnail
-        label = img_path.stem          # e.g. "02_H_id27"
-        draw.text(
-            (x + THUMB_W // 2, y + THUMB_H + 6),
-            label, fill=(255, 255, 255), font=font, anchor='mt',
-        )
-
-    # Fill unused slots with a dark red placeholder
-    for idx in range(len(image_files), ROWS * COLS):
-        row, col = divmod(idx, COLS)
-        x = PADDING + col * (THUMB_W + PADDING)
-        y = PADDING + row * (THUMB_H + LABEL_H + PADDING)
-        draw.rectangle([x, y, x + THUMB_W, y + THUMB_H], fill=(80, 20, 20))
-        draw.text(
-            (x + THUMB_W // 2, y + THUMB_H // 2),
-            "—", fill=(160, 60, 60), font=font, anchor='mm',
-        )
+        if obstacle_id in snap_files:
+            img_bgr = cv2.imread(str(snap_files[obstacle_id]))
+            if img_bgr is None:
+                continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(img_rgb).resize(
+                (THUMB_W, THUMB_H), Image.Resampling.LANCZOS
+            )
+            grid.paste(pil_img, (x, y))
+        else:
+            # Dark-red placeholder (matching screenshot)
+            draw.rectangle(
+                [x, y, x + THUMB_W, y + THUMB_H],
+                fill=(178, 34, 34),
+            )
+            draw.text(
+                (x + THUMB_W // 2, y + THUMB_H // 2),
+                f"Image {obstacle_id}",
+                fill=(255, 255, 255),
+                font=font_lbl,
+                anchor='mm',
+            )
 
     out_path = results_dir / 'tiled_result.jpg'
-    grid.save(str(out_path), quality=92)
-    print(f"🖼️   Tiled image saved: {out_path}")
+    grid.save(str(out_path), quality=95)
+    print(f"🖼️   Tiled image saved: {out_path}  ({n} slots, "
+          f"{len(snap_files)} recognised)")
     return out_path
 
 
@@ -513,18 +582,31 @@ def stitch():
     """
     Point 7: Build a tiled grid of all annotated SNAP images and open it on
     the PC screen.  Called by main_runner.py at the end of every run.
+
+    Query params:
+      total (int, default=0)  – total number of obstacles in this run.
+          Used to pre-allocate numbered red placeholder slots for any obstacle
+          whose image wasn't captured yet (matching the Point-7 screenshot).
     """
-    if not RESULTS_DIR.exists() or not any(RESULTS_DIR.glob('*.jpg')):
+    total = request.args.get('total', 0, type=int)
+
+    RESULTS_DIR.mkdir(exist_ok=True)
+    count = len([p for p in RESULTS_DIR.glob('*.jpg') if 'tiled' not in p.name])
+
+    if count == 0 and total == 0:
         return jsonify({"status": "no snap images found"}), 200
 
     def _do_stitch():
-        out = _build_tiled_image(RESULTS_DIR)
+        out = _build_tiled_image(RESULTS_DIR, total_obstacles=total)
         if out:
             _open_file(out)
 
     threading.Thread(target=_do_stitch, daemon=True).start()
-    count = len([p for p in RESULTS_DIR.glob('*.jpg') if 'tiled' not in p.name])
-    return jsonify({"status": "building tiled display", "snap_count": count}), 200
+    return jsonify({
+        "status":         "building tiled display",
+        "snap_count":     count,
+        "total_obstacles": total,
+    }), 200
 
 
 @app.route('/stitch-reset', methods=['GET'])
